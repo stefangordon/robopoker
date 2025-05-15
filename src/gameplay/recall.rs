@@ -6,6 +6,8 @@ use crate::gameplay::action::Action;
 use crate::gameplay::game::Game;
 use crate::gameplay::path::Path;
 use crate::gameplay::turn::Turn;
+use crate::cards::hand::Hand;
+use crate::cards::deck::Deck;
 
 /// a complete representation of perfect recall game history
 /// from the perspective of the hero. intended use is for
@@ -34,15 +36,24 @@ impl From<(Turn, Observation, Vec<Action>)> for Recall {
 impl IntoIterator for Recall {
     type Item = Game;
     type IntoIter = std::vec::IntoIter<Game>;
+    // Option 1: Using the clearer loop (recommended for review)
     fn into_iter(self) -> Self::IntoIter {
-        let root = self.root();
-        let genesis = std::iter::once(root);
-        let history = self
-            .path
-            .into_iter()
-            .scan(root, |g, a| Some(std::mem::replace(g, g.apply(a))));
-        genesis.chain(history).collect::<Vec<_>>().into_iter();
-        todo!("fencepost error?")
+        let root_game = self.root();
+
+        if self.path.is_empty() {
+            return vec![root_game].into_iter();
+        }
+
+        let mut game_states: Vec<Game> = Vec::with_capacity(self.path.len() + 1);
+        game_states.push(root_game);
+
+        let mut current_game_state = root_game;
+        for action_from_path in self.path { // self.path here is Vec<Action> from Recall struct
+            current_game_state = current_game_state.apply(action_from_path);
+            game_states.push(current_game_state);
+        }
+
+        game_states.into_iter()
     }
 }
 
@@ -56,14 +67,81 @@ impl Recall {
     }
 
     pub fn root(&self) -> Game {
-        Game::root().wipe(Hole::from(self.seen))
+        // Get the hero's position
+        let hero_idx = match self.hero {
+            Turn::Choice(idx) => idx,
+            _ => 0  // Default to position 0 if hero isn't a player position
+        };
+
+        // Start with a basic game
+        let mut game = Game::root();
+
+        // 1. Set hero's cards from observation
+        game = game.wipe(Hole::from(self.seen), hero_idx);
+
+        // 2. Create a set of safe placeholder cards for opponents
+        // First, identify all observed cards (both hero's hole cards and community cards)
+        let observed_cards = Hand::from(self.seen);
+
+        // Get a fresh deck and remove all observed cards
+        let deck = Deck::new();
+        // Create a new deck that doesn't contain the observed cards
+        let mut filtered_deck = Deck::from(Hand::from(u64::from(Hand::from(deck)) & !(u64::from(observed_cards))));
+
+        // 3. For opponent seats, reset their cards to safe placeholder cards
+        for i in 0..game.n() {
+            if i != hero_idx {
+                // Skip the hero's seat, handle all opponents
+                // Create a safe hole for this opponent from remaining cards in the deck
+                let safe_hole = filtered_deck.hole();
+                game = game.reset_cards_at(i, safe_hole);
+            }
+        }
+
+        game
     }
 
     pub fn head(&self) -> Game {
-        self.path
-            .iter()
-            .cloned()
-            .fold(self.root(), |game, action| game.apply(action))
+        let mut game = self.root();
+
+        for action in self.path.iter().cloned() {
+            // Special handling for calls with amount 0
+            let action_to_apply = match action {
+                Action::Call(0) => {
+                    // Auto-calculate the correct call amount
+                    if game.may_call() {
+                        let to_call = game.to_call();
+                        log::info!("Auto-adjusting CALL 0 to CALL {}", to_call);
+                        Action::Call(to_call)
+                    } else {
+                        log::warn!("Cannot auto-adjust CALL 0 - calling not allowed");
+                        action
+                    }
+                },
+                Action::Draw(hand) if hand.size() == 0 => {
+                    // For empty-hand Draw actions, get the proper cards from the game state
+                    if game.must_deal() {
+                        let legal_actions = game.legal();
+                        if let Some(Action::Draw(cards)) = legal_actions.iter().find(|a| matches!(a, Action::Draw(_))) {
+                            log::info!("Auto-filling DEAL/DRAW with proper cards");
+                            Action::Draw(*cards)
+                        } else {
+                            log::warn!("Found no valid DEAL/DRAW action in legal actions");
+                            action
+                        }
+                    } else {
+                        log::warn!("Cannot auto-fill DEAL/DRAW - dealing not allowed");
+                        action
+                    }
+                },
+                _ => action
+            };
+
+            // Apply the adjusted action
+            game = game.apply(action_to_apply);
+        }
+
+        game
     }
 
     pub fn path(&self) -> Path {

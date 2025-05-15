@@ -31,7 +31,7 @@ type Utility = f32;
 type Probability = f32;
 
 // game tree parameters
-const N: usize = 2;
+const N: usize = 2; // from 2
 const STACK: Chips = 100;
 const B_BLIND: Chips = 2;
 const S_BLIND: Chips = 1;

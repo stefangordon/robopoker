@@ -110,11 +110,10 @@ impl TryFrom<&str> for Action {
         match parts[0].to_uppercase().as_str() {
             "CHECK" => Ok(Action::Check),
             "FOLD" => Ok(Action::Fold),
-            "CALL" => parts
-                .get(1)
-                .and_then(|n| n.parse().ok())
-                .map(Action::Call)
-                .ok_or("invalid call amount"),
+            "CALL" => {
+                // Always use 0 for call amount - will be filled in later
+                Ok(Action::Call(0))
+            },
             "RAISE" => parts
                 .get(1)
                 .and_then(|n| n.parse().ok())
@@ -130,9 +129,18 @@ impl TryFrom<&str> for Action {
                 .and_then(|n| n.parse().ok())
                 .map(Action::Blind)
                 .ok_or("invalid blind amount"),
-            "DEAL" => Hand::try_from(parts[1..].join(" ").as_str())
-                .map(Action::Draw)
-                .map_err(|_| "invalid deal cards"),
+            "DEAL" | "DRAW" => {
+                if parts.len() > 1 {
+                    // If cards are specified
+                    Hand::try_from(parts[1..].join(" ").as_str())
+                        .map(Action::Draw)
+                        .map_err(|_| "invalid deal cards")
+                } else {
+                    // If just "DRAW" is provided without cards
+                    // Use an empty hand - the game will derive the right cards
+                    Ok(Action::Draw(Hand::empty()))
+                }
+            },
             _ => Err("invalid action type"),
         }
     }

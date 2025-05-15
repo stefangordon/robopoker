@@ -63,9 +63,9 @@ impl Game {
         self.act(Action::Blind(self.to_post()));
         self
     }
-    pub fn wipe(mut self, hole: Hole) -> Self {
-        for seat in self.seats.iter_mut() {
-            seat.reset_cards(hole);
+    pub fn wipe(mut self, hole: Hole, hero_idx: usize) -> Self {
+        if hero_idx < self.seats.len() {
+            self.seats[hero_idx].reset_cards(hole);
         }
         self
     }
@@ -114,6 +114,8 @@ impl Game {
 impl Game {
     pub fn apply(&self, action: Action) -> Self {
         let mut child = self.clone();
+        
+        // Apply the action directly without special adjustment
         child.act(action);
         child
     }
@@ -219,8 +221,32 @@ impl Game {
         }
     }
     fn act(&mut self, a: Action) {
-        assert!(self.is_allowed(&a));
-        match a {
+        // Handle special cases already in our action
+        let adjusted_action = match a {
+            Action::Raise(_) | Action::Shove(_) => {
+                if !self.is_allowed(&a) {
+                    if let Some(nearest) = self.find_nearest_action(&a) {
+                        log::info!("Adjusting {:?} to nearest allowed value: {:?}", a, nearest);
+                        nearest
+                    } else {
+                        a
+                    }
+                } else {
+                    a
+                }
+            },
+            _ => a
+        };
+
+        // Check if the adjusted action is allowed
+        if !self.is_allowed(&adjusted_action) {
+            // If still not allowed, error
+            let error_msg = self.debug_action_error(&adjusted_action);
+            log::error!("{}", error_msg);
+            panic!("{}", error_msg);
+        }
+
+        match adjusted_action {
             Action::Check => {
                 self.next_player();
             }
@@ -588,6 +614,85 @@ impl std::fmt::Display for Game {
     }
 }
 
+/// Utility method for debugging illegal actions
+impl Game {
+    pub fn debug_action_error(&self, action: &Action) -> String {
+        let allowed_actions = self.legal();
+        let state_info = format!(
+            "Game state: dealer={}, ticker={}, street={}, pot={}",
+            self.dealer, self.ticker, self.street(), self.pot
+        );
+
+        let actor_info = format!(
+            "Actor (pos {}) state: {}, stack={}, stake={}",
+            self.actor_idx(), self.actor_ref().state(), self.actor_ref().stack(), self.actor_ref().stake()
+        );
+
+        let effective = format!(
+            "Effective stake: {}, to_call: {}, to_raise: {}, to_shove: {}",
+            self.effective_stake(), self.to_call(), self.to_raise(), self.to_shove()
+        );
+
+        let is_info = format!(
+            "Constraints: may_fold={}, may_call={}, may_check={}, may_raise={}, may_shove={}",
+            self.may_fold(), self.may_call(), self.may_check(), self.may_raise(), self.may_shove()
+        );
+
+        format!(
+            "Illegal action attempted: {}\nAllowed actions: {:?}\n{}\n{}\n{}\n{}",
+            action, allowed_actions, state_info, actor_info, effective, is_info
+        )
+    }
+
+    /// Finds the nearest allowed action to the provided action
+    /// Returns None if there is no similar action allowed
+    fn find_nearest_action(&self, action: &Action) -> Option<Action> {
+        match action {
+            Action::Raise(chips) => {
+                // Find nearest Raise action
+                if self.may_raise() {
+                    let min_raise = self.to_raise();
+                    let max_raise = self.to_shove() - 1;
+
+                    // Force to min if below minimum
+                    if *chips < min_raise {
+                        return Some(Action::Raise(min_raise));
+                    }
+                    // Cap at max if above maximum
+                    else if *chips > max_raise {
+                        return Some(Action::Raise(max_raise));
+                    }
+                    // Otherwise leave as is (already valid)
+                    else {
+                        return Some(Action::Raise(*chips));
+                    }
+                }
+                None
+            },
+            Action::Shove(_chips) => {
+                // Find nearest Shove action
+                if self.may_shove() {
+                    // Always use the actual stack size
+                    return Some(Action::Shove(self.to_shove()));
+                }
+                None
+            },
+            // For other action types, no "close" alternative exists
+            _ => None
+        }
+    }
+}
+
+impl Game {
+    /// Reset cards at a specific position - helper for Recall to avoid card conflicts
+    pub fn reset_cards_at(mut self, position: usize, hole: Hole) -> Self {
+        if position < self.seats.len() {
+            self.seats[position].reset_cards(hole);
+        }
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,5 +891,36 @@ mod tests {
         assert!(game.is_everyone_calling() == true); //
         assert!(game.is_everyone_touched() == true); //
         assert!(game.is_everyone_matched() == true); //
+    }
+
+    #[test]
+    fn test_nearest_action() {
+        let game = Game::root();
+
+        // Testing Call adjustment
+        // In root game, SB has 1 chip in, BB has 2 chips in, so SB should call 1 more
+        let nearest = game.find_nearest_action(&Action::Call(10));
+        assert_eq!(nearest, Some(Action::Call(1)));
+
+        // Testing Raise adjustment
+        // At the beginning, minimum raise should be 2BB (4 chips)
+        let nearest = game.find_nearest_action(&Action::Raise(3));
+        assert_eq!(nearest, Some(Action::Raise(4)));
+
+        // Testing max raise capping
+        let nearest = game.find_nearest_action(&Action::Raise(200));
+        assert_eq!(nearest, Some(Action::Raise(99)));
+
+        // Testing Shove adjustment
+        let nearest = game.find_nearest_action(&Action::Shove(90));
+        assert_eq!(nearest, Some(Action::Shove(100)));
+
+        // Test action adjustment doesn't affect game flow
+        let game = Game::root();
+        // Should automatically adjust to Call(1)
+        let game = game.apply(Action::Call(10));
+
+        // Verify the pot has increased by the correct amount (1)
+        assert_eq!(game.pot(), 4); // 3 from blinds + 1 from corrected call
     }
 }

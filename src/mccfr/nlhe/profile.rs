@@ -28,9 +28,8 @@ impl crate::mccfr::traits::profile::Profile for Profile {
     }
 
     fn walker(&self) -> Self::T {
-        match self.iterations % 2 {
-            0 => Turn::Choice(0),
-            _ => Turn::Choice(1),
+        match self.iterations % crate::N {
+            player_idx => Turn::Choice(player_idx),
         }
     }
     fn epochs(&self) -> usize {
@@ -78,8 +77,8 @@ impl crate::save::upload::Table for Profile {
             present,
             future,
             edge,
-            policy,
-            regret
+            regret,
+            policy
         )
         FROM STDIN BINARY
         "

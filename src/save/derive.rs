@@ -43,7 +43,7 @@ impl Derive for Abstraction {
         CREATE OR REPLACE FUNCTION get_population(xxx BIGINT) RETURNS INTEGER AS
         $$ BEGIN RETURN (SELECT COUNT(*) FROM isomorphism e WHERE e.abs = xxx); END; $$
         LANGUAGE plpgsql;
-        
+
         CREATE OR REPLACE FUNCTION get_street_abs(abs BIGINT) RETURNS SMALLINT AS
         $$ BEGIN RETURN (abs >> 56)::SMALLINT; END; $$
         LANGUAGE plpgsql;
@@ -108,7 +108,14 @@ impl Derive for Street {
         ALTER TABLE street SET UNLOGGED;
 
         CREATE OR REPLACE FUNCTION get_niso(s SMALLINT) RETURNS INTEGER AS
-        $$ BEGIN RETURN (SELECT COUNT(*) FROM isomorphism e WHERE e.street = s); END; $$
+        $$ BEGIN
+            RETURN (
+                SELECT COUNT(*)
+                FROM isomorphism e
+                INNER JOIN abstraction a ON e.abs = a.abs
+                WHERE a.street = s
+            );
+        END; $$
         LANGUAGE plpgsql;
 
         CREATE OR REPLACE FUNCTION get_nabs(s SMALLINT) RETURNS INTEGER AS
@@ -129,8 +136,8 @@ impl Derive for Street {
                 nobs,
                 nabs
             ) VALUES (  ({}),
-                get_niso({}),
-                get_nabs({})
+                get_niso(({})::SMALLINT),
+                get_niso(({})::SMALLINT)
             );",
             street, street, street
         )
