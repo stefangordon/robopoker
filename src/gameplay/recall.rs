@@ -58,6 +58,33 @@ impl IntoIterator for Recall {
 }
 
 impl Recall {
+    /// Adjusts an action so that it is legal in the given game state, performing
+    /// the same auto-fill logic as used by `head()`.
+    fn adjust_action(game: &Game, action: Action) -> Action {
+        match action {
+            Action::Call(_) => {
+                let call_amount = game.to_call();
+                if call_amount > 0 {
+                    Action::Call(call_amount)
+                } else {
+                    Action::Check
+                }
+            }
+            Action::Draw(hand) if hand.size() == 0 => {
+                if let Some(Action::Draw(cards)) = game
+                    .legal()
+                    .into_iter()
+                    .find(|a| matches!(a, Action::Draw(_)))
+                {
+                    Action::Draw(cards)
+                } else {
+                    Action::Draw(hand) // keep original
+                }
+            }
+            other => other,
+        }
+    }
+
     pub fn new(seen: Observation, hero: Turn) -> Self {
         Self {
             seen,
@@ -106,33 +133,7 @@ impl Recall {
 
         for action in self.path.iter().cloned() {
             // Special handling for calls with amount 0
-            let action_to_apply = match action {
-                Action::Call(0) => {
-                    // Auto-calculate the correct call amount
-                    // Instead of game.may_call(), check if calling is in legal actions
-                    let legal_actions = game.legal();
-                    if let Some(Action::Call(amount)) = legal_actions.iter().find(|a| matches!(a, Action::Call(_))) {
-                        log::info!("Auto-adjusting CALL 0 to CALL {}", amount);
-                        Action::Call(*amount)
-                    } else {
-                        log::warn!("Cannot auto-adjust CALL 0 - calling not allowed");
-                        action
-                    }
-                },
-                Action::Draw(hand) if hand.size() == 0 => {
-                    // For empty-hand Draw actions, get the proper cards from the game state
-                    // Instead of game.must_deal(), check for Draw in legal actions
-                    let legal_actions = game.legal();
-                    if let Some(Action::Draw(cards)) = legal_actions.iter().find(|a| matches!(a, Action::Draw(_))) {
-                        log::info!("Auto-filling DEAL/DRAW with proper cards");
-                        Action::Draw(*cards)
-                    } else {
-                        log::warn!("Found no valid DEAL/DRAW action in legal actions");
-                        action
-                    }
-                },
-                _ => action
-            };
+            let action_to_apply = Self::adjust_action(&game, action);
 
             // Apply the adjusted action
             game = game.apply(action_to_apply);
@@ -142,11 +143,16 @@ impl Recall {
     }
 
     pub fn path(&self) -> Path {
-        self.clone()
-            .into_iter()
-            .zip(self.path.iter().copied())
-            .map(|(g, a)| g.edgify(a))
-            .collect::<Path>()
+        let mut edges_vec = Vec::with_capacity(self.path.len());
+        let mut game = self.root();
+
+        for &raw_action in self.path.iter() {
+            let adj = Self::adjust_action(&game, raw_action);
+            edges_vec.push(game.edgify(adj));
+            game = game.apply(adj);
+        }
+
+        edges_vec.into()
     }
 
     pub fn isomorphism(&self) -> Isomorphism {
