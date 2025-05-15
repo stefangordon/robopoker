@@ -109,10 +109,11 @@ impl Recall {
             let action_to_apply = match action {
                 Action::Call(0) => {
                     // Auto-calculate the correct call amount
-                    if game.may_call() {
-                        let to_call = game.to_call();
-                        log::info!("Auto-adjusting CALL 0 to CALL {}", to_call);
-                        Action::Call(to_call)
+                    // Instead of game.may_call(), check if calling is in legal actions
+                    let legal_actions = game.legal();
+                    if let Some(Action::Call(amount)) = legal_actions.iter().find(|a| matches!(a, Action::Call(_))) {
+                        log::info!("Auto-adjusting CALL 0 to CALL {}", amount);
+                        Action::Call(*amount)
                     } else {
                         log::warn!("Cannot auto-adjust CALL 0 - calling not allowed");
                         action
@@ -120,17 +121,13 @@ impl Recall {
                 },
                 Action::Draw(hand) if hand.size() == 0 => {
                     // For empty-hand Draw actions, get the proper cards from the game state
-                    if game.must_deal() {
-                        let legal_actions = game.legal();
-                        if let Some(Action::Draw(cards)) = legal_actions.iter().find(|a| matches!(a, Action::Draw(_))) {
-                            log::info!("Auto-filling DEAL/DRAW with proper cards");
-                            Action::Draw(*cards)
-                        } else {
-                            log::warn!("Found no valid DEAL/DRAW action in legal actions");
-                            action
-                        }
+                    // Instead of game.must_deal(), check for Draw in legal actions
+                    let legal_actions = game.legal();
+                    if let Some(Action::Draw(cards)) = legal_actions.iter().find(|a| matches!(a, Action::Draw(_))) {
+                        log::info!("Auto-filling DEAL/DRAW with proper cards");
+                        Action::Draw(*cards)
                     } else {
-                        log::warn!("Cannot auto-fill DEAL/DRAW - dealing not allowed");
+                        log::warn!("Found no valid DEAL/DRAW action in legal actions");
                         action
                     }
                 },
