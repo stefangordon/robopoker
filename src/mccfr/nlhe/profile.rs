@@ -4,6 +4,9 @@ use super::info::Info;
 use super::turn::Turn;
 use crate::cards::street::Street;
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::io::BufWriter;
+use std::fs::File;
 
 #[derive(Default)]
 pub struct Profile {
@@ -180,39 +183,35 @@ impl crate::save::disk::Disk for Profile {
     fn save(&self) {
         const N_FIELDS: u16 = 6;
         let ref path = Self::path(Street::random());
-        let ref mut file = File::create(path).expect(&format!("touch {}", path));
-        // Report save progress by info-set (bucket)
+        let file = File::create(path).expect(&format!("touch {}", path));
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
         let total_buckets = self.encounters.len();
         log::info!("Saving blueprint to {} ({} info-sets)", path, total_buckets);
         use crate::Arbitrary;
         use byteorder::WriteBytesExt;
         use byteorder::BE;
-        use std::fs::File;
-        use std::io::Write;
         log::info!("{:<32}{:<32}", "saving      blueprint", path);
-        file.write_all(Self::header()).expect("header");
-        // Write each info-set and log periodically
+        writer.write_all(Self::header()).expect("header");
         for (idx, (_bucket, strategy)) in self.encounters.iter().enumerate() {
-            // Log every 5000 buckets or on the last one
-            if idx % 5000 == 0 || idx + 1 == total_buckets {
+            if idx % 50000 == 0 || idx + 1 == total_buckets {
                 log::info!("  saved {}/{} info-sets", idx + 1, total_buckets);
             }
             for (edge, memory) in strategy.iter() {
-                file.write_u16::<BE>(N_FIELDS).unwrap();
-                file.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                file.write_u64::<BE>(u64::from(*_bucket.history())).unwrap();
-                file.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                file.write_u64::<BE>(u64::from(*_bucket.present())).unwrap();
-                file.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                file.write_u64::<BE>(u64::from(*_bucket.futures())).unwrap();
-                file.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                file.write_u64::<BE>(u64::from(edge.clone())).unwrap();
-                file.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
-                file.write_f32::<BE>(memory.1).unwrap();
-                file.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
-                file.write_f32::<BE>(memory.0).unwrap();
+                writer.write_u16::<BE>(N_FIELDS).unwrap();
+                writer.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
+                writer.write_u64::<BE>(u64::from(*_bucket.history())).unwrap();
+                writer.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
+                writer.write_u64::<BE>(u64::from(*_bucket.present())).unwrap();
+                writer.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
+                writer.write_u64::<BE>(u64::from(*_bucket.futures())).unwrap();
+                writer.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
+                writer.write_u64::<BE>(u64::from(edge.clone())).unwrap();
+                writer.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
+                writer.write_f32::<BE>(memory.1).unwrap();
+                writer.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
+                writer.write_f32::<BE>(memory.0).unwrap();
             }
         }
-        file.write_u16::<BE>(Self::footer()).expect("trailer");
+        writer.write_u16::<BE>(Self::footer()).expect("trailer");
     }
 }
