@@ -32,7 +32,7 @@ type Probability = f32;
 
 // game tree parameters
 const N: usize = 2; // from 2
-const STACK: Chips = 100;
+const STACK: Chips = 400;
 const B_BLIND: Chips = 2;
 const S_BLIND: Chips = 1;
 const MAX_RAISE_REPEATS: usize = 3;

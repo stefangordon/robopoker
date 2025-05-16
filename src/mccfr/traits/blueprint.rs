@@ -61,7 +61,12 @@ pub trait Blueprint: Send + Sync {
     where
         Self: Sized,
     {
-        'training: for _ in 0..Self::iterations() {
+        let total_iters = Self::iterations();
+        log::info!("Starting training: {} iterations", total_iters);
+        'training: for i in 0..total_iters {
+            // report progress
+            log::info!("Training progress: {}/{}", i + 1, total_iters);
+            // perform batch updates
             for ref update in self.batch() {
                 self.update_regret(update);
                 self.update_weight(update);

@@ -44,7 +44,7 @@ impl From<Action> for Edge {
             Action::Draw(_) => Edge::Draw,
             Action::Shove(_) => Edge::Shove,
             Action::Raise(_) => panic!("raise must be converted from odds"),
-            Action::Blind(_) => panic!("blinds are not in any MCCFR trees"),
+            Action::Blind(_) => Edge::Call,
         }
     }
 }

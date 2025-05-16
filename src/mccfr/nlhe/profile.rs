@@ -181,6 +181,9 @@ impl crate::save::disk::Disk for Profile {
         const N_FIELDS: u16 = 6;
         let ref path = Self::path(Street::random());
         let ref mut file = File::create(path).expect(&format!("touch {}", path));
+        // Report save progress by info-set (bucket)
+        let total_buckets = self.encounters.len();
+        log::info!("Saving blueprint to {} ({} info-sets)", path, total_buckets);
         use crate::Arbitrary;
         use byteorder::WriteBytesExt;
         use byteorder::BE;
@@ -188,15 +191,20 @@ impl crate::save::disk::Disk for Profile {
         use std::io::Write;
         log::info!("{:<32}{:<32}", "saving      blueprint", path);
         file.write_all(Self::header()).expect("header");
-        for (bucket, strategy) in self.encounters.iter() {
+        // Write each info-set and log periodically
+        for (idx, (_bucket, strategy)) in self.encounters.iter().enumerate() {
+            // Log every 5000 buckets or on the last one
+            if idx % 5000 == 0 || idx + 1 == total_buckets {
+                log::info!("  saved {}/{} info-sets", idx + 1, total_buckets);
+            }
             for (edge, memory) in strategy.iter() {
                 file.write_u16::<BE>(N_FIELDS).unwrap();
                 file.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                file.write_u64::<BE>(u64::from(*bucket.history())).unwrap();
+                file.write_u64::<BE>(u64::from(*_bucket.history())).unwrap();
                 file.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                file.write_u64::<BE>(u64::from(*bucket.present())).unwrap();
+                file.write_u64::<BE>(u64::from(*_bucket.present())).unwrap();
                 file.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                file.write_u64::<BE>(u64::from(*bucket.futures())).unwrap();
+                file.write_u64::<BE>(u64::from(*_bucket.futures())).unwrap();
                 file.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
                 file.write_u64::<BE>(u64::from(edge.clone())).unwrap();
                 file.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
