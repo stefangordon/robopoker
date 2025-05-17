@@ -58,10 +58,17 @@ impl IntoIterator for Recall {
 }
 
 impl Recall {
-    /// Adjusts an action so that it is legal in the given game state, performing
-    /// the same auto-fill logic as used by `head()`.
-    fn adjust_action(game: &Game, action: Action) -> Action {
+    /// Adjusts an action so that it is legal in the given game state.  In
+    /// particular this fills in missing information for calls (amount 0) and
+    /// draws ("DEAL" with no cards listed).
+    ///
+    /// When we see a draw with an empty hand we infer the exact cards that
+    /// should be revealed from the `seen` observation, instead of taking a
+    /// random legal draw (which would desynchronise the board and break
+    /// blueprint look-ups).
+    fn adjust_action(&self, game: &Game, action: Action) -> Action {
         match action {
+            // Calls with amount 0 → fill in correct chips or downgrade to check.
             Action::Call(_) => {
                 let call_amount = game.to_call();
                 if call_amount > 0 {
@@ -70,16 +77,21 @@ impl Recall {
                     Action::Check
                 }
             }
+            // "DEAL" without explicit cards → derive the community cards the
+            // hero has already seen.
             Action::Draw(hand) if hand.size() == 0 => {
-                if let Some(Action::Draw(cards)) = game
-                    .legal()
-                    .into_iter()
-                    .find(|a| matches!(a, Action::Draw(_)))
-                {
-                    Action::Draw(cards)
-                } else {
-                    Action::Draw(hand) // keep original
-                }
+                let street = game.street();
+                // cards that *should* be revealed at this street, according to
+                // the observation passed in the request.
+                let reveal: Hand = self
+                    .seen
+                    .public()
+                    .clone()
+                    .skip(street.n_observed())
+                    .take(street.n_revealed())
+                    .collect::<Vec<Card>>()
+                    .into();
+                Action::Draw(reveal)
             }
             other => other,
         }
@@ -132,8 +144,8 @@ impl Recall {
         let mut game = self.root();
 
         for action in self.path.iter().cloned() {
-            // Special handling for calls with amount 0
-            let action_to_apply = Self::adjust_action(&game, action);
+            // Fill in any missing information before applying.
+            let action_to_apply = self.adjust_action(&game, action);
 
             // Apply the adjusted action
             game = game.apply(action_to_apply);
@@ -147,12 +159,14 @@ impl Recall {
         let mut game = self.root();
 
         for &raw_action in self.path.iter() {
-            let adj = Self::adjust_action(&game, raw_action);
+            let adj = self.adjust_action(&game, raw_action);
             edges_vec.push(game.edgify(adj));
             game = game.apply(adj);
         }
 
-        edges_vec.into()
+        // Blueprint stores the most-recent edge in the least-significant nibble,
+        // so we must reverse the chronological order before packing.
+        edges_vec.into_iter().rev().collect::<Vec<_>>().into()
     }
 
     pub fn isomorphism(&self) -> Isomorphism {

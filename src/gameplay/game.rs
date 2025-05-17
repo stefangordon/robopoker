@@ -670,25 +670,41 @@ impl Game {
     fn find_nearest_action(&self, action: &Action) -> Option<Action> {
         match action {
             Action::Raise(chips) => {
-                // Find nearest Raise action
-                if self.may_raise() {
-                    let min_raise = self.to_raise();
-                    let max_raise = self.to_shove() - 1;
+                // Shortcut: if raising is currently disallowed (the minimum
+                // legal raise exceeds the player's remaining stack) but a
+                // shove is still legal, map any raise attempt to an all-in.
 
-                    // Force to min if below minimum
-                    if *chips < min_raise {
-                        return Some(Action::Raise(min_raise));
-                    }
-                    // Cap at max if above maximum
-                    else if *chips > max_raise {
-                        return Some(Action::Raise(max_raise));
-                    }
-                    // Otherwise leave as is (already valid)
-                    else {
-                        return Some(Action::Raise(*chips));
-                    }
+                if !self.may_raise() && self.may_shove() {
+                    return Some(Action::Shove(self.to_shove()));
                 }
-                None
+
+                // Suggest an alternative when the requested raise is outside
+                // the legal range.  If the player attempts to raise *at least*
+                // the maximum stack, treat it as a shove.  This spares the
+                // client from having to distinguish between a very large raise
+                // and an all-in.
+
+                let min_raise = self.to_raise();
+                let max_raise = self.to_shove() - 1;
+
+                if *chips < min_raise {
+                    // Too small → bump to minimum legal raise.
+                    Some(Action::Raise(min_raise))
+                } else if *chips >= self.to_shove() {
+                    // Larger than stack → convert to shove if allowed.
+                    if self.may_shove() {
+                        Some(Action::Shove(self.to_shove()))
+                    } else {
+                        None
+                    }
+                } else if *chips > max_raise {
+                    // Between (max_raise, to_shove) is not a legal raise size.
+                    // Move to the largest legal raise (max_raise).
+                    Some(Action::Raise(max_raise))
+                } else {
+                    // Inside legal range – keep amount.
+                    Some(Action::Raise(*chips))
+                }
             },
             Action::Shove(_chips) => {
                 // Find nearest Shove action

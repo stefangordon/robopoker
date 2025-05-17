@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::io::BufWriter;
 use std::fs::File;
+use std::mem::size_of;
 
 #[derive(Default)]
 pub struct Profile {
@@ -184,7 +185,7 @@ impl crate::save::disk::Disk for Profile {
         const N_FIELDS: u16 = 6;
         let ref path = Self::path(Street::random());
         let file = File::create(path).expect(&format!("touch {}", path));
-        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        let mut writer = BufWriter::with_capacity(1024 * 1024 * 10, file);
         let total_buckets = self.encounters.len();
         log::info!("Saving blueprint to {} ({} info-sets)", path, total_buckets);
         use crate::Arbitrary;
@@ -193,7 +194,7 @@ impl crate::save::disk::Disk for Profile {
         log::info!("{:<32}{:<32}", "saving      blueprint", path);
         writer.write_all(Self::header()).expect("header");
         for (idx, (_bucket, strategy)) in self.encounters.iter().enumerate() {
-            if idx % 50000 == 0 || idx + 1 == total_buckets {
+            if idx % (100000) == 0 || idx + 1 == total_buckets {
                 log::info!("  saved {}/{} info-sets", idx + 1, total_buckets);
             }
             for (edge, memory) in strategy.iter() {
@@ -213,5 +214,6 @@ impl crate::save::disk::Disk for Profile {
             }
         }
         writer.write_u16::<BE>(Self::footer()).expect("trailer");
+        writer.flush().expect("flush blueprint buffer");
     }
 }

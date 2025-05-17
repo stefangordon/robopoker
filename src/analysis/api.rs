@@ -817,11 +817,34 @@ impl API {
         let abstraction = self.obs_to_abs(observation).await?;
         let history = recall.path();
         let present = abstraction;
-        let futures = Path::from(crate::mccfr::nlhe::encoder::Encoder::choices(game, 0));
+        // Determine how many raises have occurred in the current betting round
+        // (i.e. since the last chance event).  This mirrors the logic used in
+        // Encoder::info when the blueprint was generated so that the `future`
+        // bucket we query matches what exists in the database.
+
+        use crate::gameplay::edge::Edge as GEdge;
+        let history_edges: Vec<GEdge> = Vec::<GEdge>::from(history.clone());
+        let depth = history_edges
+            .iter()
+            .rev()                          // walk backwards from most recent
+            .take_while(|e| e.is_choice())   // stop at first chance edge (Draw)
+            .filter(|e| e.is_aggro())        // count only aggressive actions
+            .count();
+
+        let futures = Path::from(crate::mccfr::nlhe::encoder::Encoder::choices(game, depth));
         let ref history = i64::from(history);
         let ref present = i64::from(present);
         let ref futures = i64::from(futures);
         let rows = self.0.query(SQL, &[history, present, futures]).await?;
+        if rows.is_empty() {
+            log::info!(
+                "policy lookup miss – past: {}, present: {}, future: {}, recall: {:?}",
+                history,
+                present,
+                futures,
+                recall
+            );
+        }
         Ok(rows.into_iter().map(Decision::from).collect())
     }
 }

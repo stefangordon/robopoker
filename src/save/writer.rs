@@ -12,11 +12,13 @@ use std::fs::File;
 use std::io::BufReader;
 use std::io::Read;
 use std::io::Seek;
+use std::io::SeekFrom;
 use std::sync::Arc;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::Client;
 use tokio_postgres::Error as E;
+use futures::pin_mut;
 
 pub struct Writer(Arc<Client>);
 
@@ -29,6 +31,17 @@ impl From<Arc<Client>> for Writer {
 impl Writer {
     pub async fn publish() -> Result<(), E> {
         let postgres = Self(crate::db().await);
+
+        // Speed up large COPY operations for this session.
+        // – no fsync for each statement
+        // – larger work_mem buffers for index build later
+        postgres
+            .0
+            .batch_execute(
+                "SET synchronous_commit = OFF; SET temp_buffers = '512MB';",
+            )
+            .await?;
+
         postgres.upload::<Metric>().await?;
         postgres.upload::<Decomp>().await?;
         postgres.upload::<Encoder>().await?;
@@ -86,31 +99,85 @@ impl Writer {
     {
         let sink = self.0.copy_in(&T::copy()).await?;
         let writer = BinaryCopyInWriter::new(sink, T::columns());
-        futures::pin_mut!(writer);
-        let ref mut fields = [0u8; 2];
-        for ref mut reader in T::sources()
+        pin_mut!(writer);
+
+        // Tune batch size for best throughput.
+        const BATCH: usize = 8_192;
+        let mut buffer: Vec<[Field; 6]> = Vec::with_capacity(BATCH);
+
+        // --- progress tracking -------------------------------------------------
+        let total_bytes: u64 = T::sources()
             .iter()
-            .map(|s| File::open(s).expect("file not found"))
-            .map(|f| BufReader::new(f))
-        {
-            reader.seek(std::io::SeekFrom::Start(19)).unwrap();
-            while let Ok(()) = reader.read_exact(fields) {
-                match u16::from_be_bytes(*fields) {
-                    0xFFFF => break,
-                    length => {
-                        assert!(T::columns().len() == length as usize);
-                        let row = (0..length).map(|_| {
-                            match reader.read_u32::<BE>().expect("field size (bytes)") {
-                                4 => Field::F32(reader.read_f32::<BE>().unwrap()),
-                                8 => Field::I64(reader.read_i64::<BE>().unwrap()),
-                                x => panic!("unsupported type: {}", x),
-                            }
-                        });
-                        writer.as_mut().write_raw(row).await?;
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
+        let mut processed_bytes: u64 = 0;
+        let mut last_pct: u64 = 0;
+        // ----------------------------------------------------------------------
+
+        let mut tag = [0u8; 2];
+
+        for src in T::sources() {
+            let mut reader = BufReader::new(File::open(src).expect("file not found"));
+            reader.seek(SeekFrom::Start(19)).unwrap(); // skip binary header
+
+            let file_start = processed_bytes; // bytes processed so far before this file
+
+            loop {
+                if let Err(_) = reader.read_exact(&mut tag) {
+                    break;
+                }
+
+                if u16::from_be_bytes(tag) == 0xFFFF {
+                    break;
+                }
+
+                // We know there are exactly 6 fields; skip per-field size ints.
+                let _ = reader.read_u32::<BE>(); // past len
+                let past = reader.read_i64::<BE>().unwrap();
+                let _ = reader.read_u32::<BE>();
+                let present = reader.read_i64::<BE>().unwrap();
+                let _ = reader.read_u32::<BE>();
+                let future = reader.read_i64::<BE>().unwrap();
+                let _ = reader.read_u32::<BE>();
+                let edge = reader.read_i64::<BE>().unwrap();
+                let _ = reader.read_u32::<BE>();
+                let regret = reader.read_f32::<BE>().unwrap();
+                let _ = reader.read_u32::<BE>();
+                let policy = reader.read_f32::<BE>().unwrap();
+
+                buffer.push([
+                    Field::I64(past),
+                    Field::I64(present),
+                    Field::I64(future),
+                    Field::I64(edge),
+                    Field::F32(regret),
+                    Field::F32(policy),
+                ]);
+
+                if buffer.len() == BATCH {
+                    for row in &buffer {
+                        writer.as_mut().write_raw(row.iter()).await?;
+                    }
+                    buffer.clear();
+                }
+
+                // Progress: use current stream position
+                if let Ok(pos) = reader.stream_position() {
+                    processed_bytes = file_start + pos;
+                    let pct = processed_bytes.saturating_mul(100) / total_bytes.max(1);
+                    if pct >= last_pct + 1 {
+                        last_pct = pct;
+                        log::info!("COPY progress: {}%", pct);
                     }
                 }
             }
         }
+
+        // write any remaining rows
+        for row in &buffer {
+            writer.as_mut().write_raw(row.iter()).await?;
+        }
+
         writer.finish().await?;
         Ok(())
     }
