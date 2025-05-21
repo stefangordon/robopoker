@@ -50,12 +50,31 @@ impl Blueprint for super::solver::NLHE {
     fn solve(mut self) -> Self {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         use rustc_hash::FxHashMap;
+        #[cfg(feature = "native")]
+        use crate::save::disk::Disk;
 
         let total_iters = <Self as crate::mccfr::traits::blueprint::Blueprint>::iterations();
+
+        // ------------------------------------------------------------
+        // Persist intermediate results periodically so that long runs
+        // can resume without losing more than ~100k / batch_size iters.
+        // ------------------------------------------------------------
+        const SAVE_TARGET_RAW: usize = 100_000;
+        let save_interval = (SAVE_TARGET_RAW / Self::batch_size()).max(1);
+
         log::info!("Starting training: {} iterations", total_iters);
 
         'training: for i in 0..total_iters {
             log::info!("Training progress: {}/{}", i + 1, total_iters);
+
+            // Periodic checkpoint
+            if (i + 1) % save_interval == 0 {
+                #[cfg(feature = "native")]
+                {
+                    self.profile.save();
+                    log::info!("Checkpoint saved after {} outer iterations", i + 1);
+                }
+            }
 
             let walker = self.profile.walker();
             let profile_ref = &self.profile; // immutable, but interior-mutable via DashMap
