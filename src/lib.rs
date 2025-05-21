@@ -56,7 +56,7 @@ const CFR_BATCH_SIZE_RPS: usize = 1;
 const CFR_TREE_COUNT_RPS: usize = 8192;
 
 // nlhe mccfr parameters
-const CFR_BATCH_SIZE_NLHE: usize = 64;
+const CFR_BATCH_SIZE_NLHE: usize = 128;
 const CFR_TREE_COUNT_NLHE: usize = 0x1000000;
 
 /// profile average sampling parameters

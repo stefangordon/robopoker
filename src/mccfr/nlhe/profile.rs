@@ -12,6 +12,9 @@ use zstd::stream::{Encoder as ZEncoder, Decoder as ZDecoder};
 use std::io::Seek;
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use crate::mccfr::types::policy::Policy;
+use crate::mccfr::traits::info::Info as InfoTrait;
+use smallvec::SmallVec;
 
 pub struct Profile {
     pub(super) iterations: usize,
@@ -68,6 +71,41 @@ impl crate::mccfr::traits::profile::Profile for Profile {
                 guard.get(edge).map(|(_, r)| *r)
             })
             .unwrap_or_default()
+    }
+
+    // -------------------------------------------------------------------
+    // Optimized policy_vector: cache bucket map once per infoset to avoid
+    // repeated DashMap lookups and mutex locking for each edge.
+    // -------------------------------------------------------------------
+    fn policy_vector(
+        &self,
+        infoset: &crate::mccfr::structs::infoset::InfoSet<Self::T, Self::E, Self::G, Self::I>,
+    ) -> crate::mccfr::types::policy::Policy<Self::E> {
+        let info = infoset.info();
+
+        let choices_vec = info.choices();
+        let mut small: SmallVec<[(Self::E, f32); 8]> = SmallVec::with_capacity(choices_vec.len().min(8));
+
+        if let Some(bucket_mutex) = self.encounters.get(&info) {
+            let bucket = bucket_mutex.lock();
+            for edge in choices_vec.iter().copied() {
+                let regret_raw = bucket.get(&edge).map(|(_, r)| *r).unwrap_or_default();
+                small.push((edge, regret_raw.max(crate::POLICY_MIN)));
+            }
+        } else {
+            for edge in choices_vec.iter().copied() {
+                small.push((edge, crate::POLICY_MIN));
+            }
+        }
+
+        let mut regrets_vec: Policy<Self::E> = small.into_vec();
+        let denominator: crate::Utility = regrets_vec.iter().map(|(_, r)| r).sum();
+        regrets_vec
+            .iter_mut()
+            .for_each(|(_, r)| *r /= denominator);
+        regrets_vec
+            .into_iter()
+            .collect()
     }
 }
 

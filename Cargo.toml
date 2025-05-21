@@ -41,6 +41,7 @@ rustc-hash = "1.1"
 zstd = "0.12"
 dashmap = "5"
 parking_lot = "0.12"
+smallvec = "1.11"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

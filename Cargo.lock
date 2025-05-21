@@ -1774,6 +1774,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simplelog",
+ "smallvec",
  "tokio",
  "tokio-postgres",
  "wasm-bindgen",
