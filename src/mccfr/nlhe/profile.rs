@@ -15,6 +15,8 @@ use parking_lot::Mutex;
 use crate::mccfr::types::policy::Policy;
 use crate::mccfr::traits::info::Info as InfoTrait;
 use smallvec::SmallVec;
+use std::path::PathBuf;
+use std::io::BufWriter;
 
 pub struct Profile {
     pub(super) iterations: usize,
@@ -176,14 +178,12 @@ impl crate::save::disk::Disk for Profile {
         unreachable!("must be learned in MCCFR minimization")
     }
     fn path(_: Street) -> String {
-        format!(
-            "{}/pgcopy/{}",
-            std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            Self::name()
-        )
+        let current_dir = std::env::current_dir().unwrap_or_default();
+        let path = PathBuf::from(current_dir)
+            .join("pgcopy")
+            .join(Self::name());
+
+        path.to_string_lossy().into_owned()
     }
 
     fn load(_: Street) -> Self {
@@ -270,11 +270,20 @@ impl crate::save::disk::Disk for Profile {
     }
     fn save(&self) {
         const N_FIELDS: u16 = 6;
-        let ref path = Self::path(Street::random());
-        let file = File::create(path).expect(&format!("touch {}", path));
-        let mut writer = ZEncoder::new(file, 0).expect("zstd encoder");
+        let path_str = Self::path(Street::random());
+        let path = std::path::Path::new(&path_str);
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("Failed to create parent directories");
+        }
+
+        let file = File::create(path).expect(&format!("Failed to create file at {}", path_str));
+        let buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+        let mut writer = ZEncoder::new(buf_writer, 0).expect("zstd encoder");
+        let _ = writer.multithread(2 as u32);
         let total_buckets = self.encounters.len();
-        log::info!("Saving blueprint to {} ({} info-sets)", path, total_buckets);
+        log::info!("Saving blueprint to {} ({} info-sets)", path_str, total_buckets);
 
         // For progress tracking
         let mut processed_buckets = 0;
@@ -285,7 +294,7 @@ impl crate::save::disk::Disk for Profile {
         use crate::Arbitrary;
         use byteorder::WriteBytesExt;
         use byteorder::BE;
-        log::info!("{:<32}{:<32}", "saving      blueprint", path);
+        log::info!("{:<32}{:<32}", "saving      blueprint", path_str);
         writer.write_all(Self::header()).expect("header");
         for bucket_entry in self.encounters.iter() {
             let bucket = bucket_entry.key();
@@ -315,5 +324,34 @@ impl crate::save::disk::Disk for Profile {
         }
         writer.write_u16::<BE>(Self::footer()).expect("trailer");
         writer.finish().expect("finish zstd");
+    }
+}
+
+impl Profile {
+    /// Populates the profile with synthetic data for benchmarking purposes.
+    ///
+    /// `bucket_count`: number of distinct information sets to generate.
+    /// `edges_per_bucket`: number of edges per information set.
+    pub fn populate_dummy(&mut self, bucket_count: usize, edges_per_bucket: usize) {
+        use rand::Rng;
+        use rustc_hash::FxHashMap;
+
+        for _ in 0..bucket_count {
+            let info = Info::random();
+            let bucket_mutex = self
+                .encounters
+                .entry(info)
+                .or_insert_with(|| Mutex::new(FxHashMap::with_capacity_and_hasher(4, Default::default())));
+            let mut bucket = bucket_mutex.lock();
+            for _ in 0..edges_per_bucket {
+                let edge = Edge::random();
+                let policy: f32 = rand::thread_rng().gen_range(0.0..1.0);
+                let regret: f32 = rand::thread_rng().gen_range(-1.0..1.0);
+                bucket.insert(edge, (policy, regret));
+            }
+        }
+
+        // Update iterations counter to reflect synthetic data
+        self.iterations += bucket_count;
     }
 }
