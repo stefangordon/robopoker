@@ -7,7 +7,6 @@ use std::io::Write;
 use std::fs::File;
 use std::mem::size_of;
 use crate::Arbitrary;
-use rustc_hash::FxHashMap;
 use zstd::stream::{Encoder as ZEncoder, Decoder as ZDecoder};
 use std::io::Seek;
 use dashmap::DashMap;
@@ -18,9 +17,13 @@ use smallvec::SmallVec;
 use std::path::PathBuf;
 use std::io::BufWriter;
 
+// Using SmallVec (inline capacity 8) instead of a per-infoset HashMap dramatically
+// reduces overhead. The majority of infosets have ≤8 edges.
+type Bucket = SmallVec<[(Edge, (crate::Probability, crate::Utility)); 8]>;
+
 pub struct Profile {
     pub(super) iterations: usize,
-    pub(super) encounters: DashMap<Info, Mutex<FxHashMap<Edge, (crate::Probability, crate::Utility)>>>,
+    pub(super) encounters: DashMap<Info, Mutex<Bucket>>,
 }
 
 impl Default for Profile {
@@ -35,6 +38,52 @@ impl Default for Profile {
 impl Profile {
     fn name() -> String {
         "blueprint".to_string()
+    }
+
+    /// Log aggregate statistics for regret and policy vectors instead of writing to disk.
+    /// Enabled by setting environment variable `BLUEPRINT_STATS=1` before running.
+    #[cfg(feature = "native")]
+    pub fn log_stats(&self) {
+        use std::f32::{INFINITY, NEG_INFINITY};
+
+        let mut infosets = 0usize;
+        let mut total_edges = 0usize;
+        let mut min_edges = usize::MAX;
+        let mut max_edges = 0usize;
+
+        let mut policy_min = INFINITY;
+        let mut policy_max = NEG_INFINITY;
+        let mut regret_min = INFINITY;
+        let mut regret_max = NEG_INFINITY;
+
+        for bucket_entry in self.encounters.iter() {
+            infosets += 1;
+            let bucket = bucket_entry.value().lock();
+            let count = bucket.len();
+            total_edges += count;
+            min_edges = min_edges.min(count);
+            max_edges = max_edges.max(count);
+
+            for (_, (policy, regret)) in bucket.iter() {
+                policy_min = policy_min.min(*policy);
+                policy_max = policy_max.max(*policy);
+                regret_min = regret_min.min(*regret);
+                regret_max = regret_max.max(*regret);
+            }
+        }
+
+        let avg_edges = if infosets > 0 {
+            total_edges as f64 / infosets as f64
+        } else {
+            0.0
+        };
+
+        log::info!("------------------ BLUEPRINT STATS ------------------");
+        log::info!("InfoSets:      {}", infosets);
+        log::info!("Edges / set:   min {}  max {}  avg {:.2}", min_edges, max_edges, avg_edges);
+        log::info!("Policy range:  [{:.4}, {:.4}]", policy_min, policy_max);
+        log::info!("Regret range:  [{:.4}, {:.4}]", regret_min, regret_max);
+        log::info!("-----------------------------------------------------");
     }
 }
 
@@ -57,22 +106,26 @@ impl crate::mccfr::traits::profile::Profile for Profile {
         self.iterations
     }
     fn sum_policy(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
-        self.encounters
-            .get(info)
-            .and_then(|bucket_mutex| {
-                let guard = bucket_mutex.value().lock();
-                guard.get(edge).map(|(w, _)| *w)
-            })
-            .unwrap_or_default()
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().lock();
+            bucket
+                .iter()
+                .find_map(|(e, (p, _))| if e == edge { Some(*p) } else { None })
+                .unwrap_or_default()
+        } else {
+            0.0
+        }
     }
     fn sum_regret(&self, info: &Self::I, edge: &Self::E) -> crate::Utility {
-        self.encounters
-            .get(info)
-            .and_then(|bucket_mutex| {
-                let guard = bucket_mutex.value().lock();
-                guard.get(edge).map(|(_, r)| *r)
-            })
-            .unwrap_or_default()
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().lock();
+            bucket
+                .iter()
+                .find_map(|(e, (_, r))| if e == edge { Some(*r) } else { None })
+                .unwrap_or_default()
+        } else {
+            0.0
+        }
     }
 
     // -------------------------------------------------------------------
@@ -89,9 +142,12 @@ impl crate::mccfr::traits::profile::Profile for Profile {
         let mut small: SmallVec<[(Self::E, f32); 8]> = SmallVec::with_capacity(choices_vec.len().min(8));
 
         if let Some(bucket_mutex) = self.encounters.get(&info) {
-            let bucket = bucket_mutex.lock();
+            let bucket = bucket_mutex.value().lock();
             for edge in choices_vec.iter().copied() {
-                let regret_raw = bucket.get(&edge).map(|(_, r)| *r).unwrap_or_default();
+                let regret_raw = bucket
+                    .iter()
+                    .find_map(|(e, (_, r))| if *e == edge { Some(*r) } else { None })
+                    .unwrap_or_default();
                 small.push((edge, regret_raw.max(crate::POLICY_MIN)));
             }
         } else {
@@ -219,7 +275,7 @@ impl crate::save::disk::Disk for Profile {
             reader.read_exact(&mut skip).expect("skip pgcopy header");
         }
 
-        let encounters: DashMap<Info, Mutex<FxHashMap<Edge, (crate::Probability, crate::Utility)>>> = DashMap::new();
+        let encounters: DashMap<Info, Mutex<Bucket>> = DashMap::new();
         let mut header = [0u8; 2];
         let mut record = [0u8; RECORD_SIZE - 2]; // we already read the 2-byte header separately
 
@@ -255,12 +311,11 @@ impl crate::save::disk::Disk for Profile {
             let policy = BE::read_f32(read_len(4));
 
             let bucket = Info::from((history, present, futures));
-            encounters
+            let bucket_mutex = encounters
                 .entry(bucket)
-                .or_insert_with(|| Mutex::new(FxHashMap::default()))
-                .lock()
-                .entry(edge)
-                .or_insert((policy, regret));
+                .or_insert_with(|| Mutex::new(SmallVec::new()));
+            let mut bucket = bucket_mutex.lock();
+            bucket.push((edge, (policy, regret)));
         }
 
         Self {
@@ -269,6 +324,12 @@ impl crate::save::disk::Disk for Profile {
         }
     }
     fn save(&self) {
+        // If caller only wants statistics, skip the expensive on-disk serialization.
+        if std::env::var("BLUEPRINT_STATS").is_ok() {
+            self.log_stats();
+            return;
+        }
+
         const N_FIELDS: u16 = 6;
         let path_str = Self::path(Street::random());
         let path = std::path::Path::new(&path_str);
@@ -334,20 +395,19 @@ impl Profile {
     /// `edges_per_bucket`: number of edges per information set.
     pub fn populate_dummy(&mut self, bucket_count: usize, edges_per_bucket: usize) {
         use rand::Rng;
-        use rustc_hash::FxHashMap;
 
         for _ in 0..bucket_count {
             let info = Info::random();
             let bucket_mutex = self
                 .encounters
                 .entry(info)
-                .or_insert_with(|| Mutex::new(FxHashMap::with_capacity_and_hasher(4, Default::default())));
+                .or_insert_with(|| Mutex::new(SmallVec::new()));
             let mut bucket = bucket_mutex.lock();
             for _ in 0..edges_per_bucket {
                 let edge = Edge::random();
                 let policy: f32 = rand::thread_rng().gen_range(0.0..1.0);
                 let regret: f32 = rand::thread_rng().gen_range(-1.0..1.0);
-                bucket.insert(edge, (policy, regret));
+                bucket.push((edge, (policy, regret)));
             }
         }
 

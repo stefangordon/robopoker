@@ -52,13 +52,17 @@ impl Blueprint for super::solver::NLHE {
         use rustc_hash::FxHashMap;
         #[cfg(feature = "native")]
         use crate::save::disk::Disk;
+        use std::time::{Duration, Instant};
 
         let total_iters = <Self as crate::mccfr::traits::blueprint::Blueprint>::iterations();
 
-        const SAVE_TARGET_RAW: usize = 250_000;
-        let save_interval = (SAVE_TARGET_RAW / Self::batch_size()).max(1);
-
         log::info!("Starting training: {} iterations", total_iters);
+
+        // Time-based checkpoint interval
+        #[cfg(feature = "native")]
+        let checkpoint_interval = Duration::from_secs(3600 * crate::CHECKPOINT_HOURS);
+        #[cfg(feature = "native")]
+        let mut last_checkpoint = Instant::now();
 
         // Initialize progress bar (native targets only). The long tick interval ensures
         // updates are throttled and do not add noticeable overhead to the solver.
@@ -66,15 +70,18 @@ impl Blueprint for super::solver::NLHE {
         let progress = crate::progress(total_iters);
 
         'training: for i in 0..total_iters {
+            // Periodic checkpoint every CHECKPOINT_HOURS hours
             #[cfg(feature = "native")]
-            progress.inc(1);
-
-            // Periodic checkpoint
-            if (i + 1) % save_interval == 0 {
-                #[cfg(feature = "native")]
-                {
+            {
+                progress.inc(1);
+                if last_checkpoint.elapsed() >= checkpoint_interval {
                     self.profile.save();
-                    log::info!("Checkpoint saved after {} outer iterations", i + 1);
+                    last_checkpoint = Instant::now();
+                    log::info!(
+                        "Checkpoint saved after {} elapsed hours (iteration {})",
+                        crate::CHECKPOINT_HOURS,
+                        i + 1
+                    );
                 }
             }
 
@@ -121,29 +128,35 @@ impl Blueprint for super::solver::NLHE {
                         let bucket_mutex = profile_ref
                             .encounters
                             .entry(info)
-                            .or_insert_with(|| parking_lot::Mutex::new(FxHashMap::with_capacity_and_hasher(4, Default::default())));
+                            .or_insert_with(|| parking_lot::Mutex::new(smallvec::SmallVec::new()));
 
                         let mut bucket = bucket_mutex.lock();
 
-                        let entry = bucket.entry(edge).or_insert((0.0f32, 0.0f32));
+                        // Search for edge record
+                        if let Some((_, entry)) = bucket.iter_mut().find(|(e, _)| *e == edge) {
+                            // Current values
+                            let current_policy = entry.0;
+                            let current_regret = entry.1;
 
-                        // Current values
-                        let current_policy = entry.0;
-                        let current_regret = entry.1;
+                            // Discounts (cached)
+                            let discount_r = if current_regret > 0.0 {
+                                discount_pos
+                            } else if current_regret < 0.0 {
+                                discount_neg
+                            } else {
+                                discount_none
+                            };
+                            let discount_p = discount_none;
 
-                        // Discounts (cached)
-                        let discount_r = if current_regret > 0.0 {
-                            discount_pos
-                        } else if current_regret < 0.0 {
-                            discount_neg
+                            // Update in-place
+                            entry.1 = (current_regret * discount_r + delta_r).max(crate::REGRET_MIN);
+                            entry.0 = (current_policy * discount_p + delta_p).max(crate::POLICY_MIN);
                         } else {
-                            discount_none
-                        };
-                        let discount_p = discount_none; // policy discount never depends on sign
-
-                        // Update in-place
-                        entry.1 = (current_regret * discount_r + delta_r).max(crate::REGRET_MIN);
-                        entry.0 = (current_policy * discount_p + delta_p).max(crate::POLICY_MIN);
+                            // No existing record; create new using discounts on zero
+                            let new_regret = (0.0 * discount_none + delta_r).max(crate::REGRET_MIN);
+                            let new_policy = (0.0 * discount_none + delta_p).max(crate::POLICY_MIN);
+                            bucket.push((edge, (new_policy, new_regret)));
+                        }
                     }
                 });
 

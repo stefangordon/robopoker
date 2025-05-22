@@ -55,6 +55,10 @@ const ASYMMETRIC_UTILITY: f32 = 2.0;
 const CFR_BATCH_SIZE_RPS: usize = 1;
 const CFR_TREE_COUNT_RPS: usize = 8192;
 
+/// checkpointing interval (in hours) for periodic profile saves during training
+#[cfg(feature = "native")]
+pub const CHECKPOINT_HOURS: u64 = 4;
+
 // nlhe mccfr parameters
 const CFR_BATCH_SIZE_NLHE: usize = 128;
 const CFR_TREE_COUNT_NLHE: usize = 0x1000000;
