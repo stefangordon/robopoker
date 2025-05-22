@@ -225,7 +225,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             .collect()
     }
 
-    // Reinstate optimized methods with POLICY_MIN clamping
+/*     // Reinstate optimized methods with POLICY_MIN clamping
     #[inline(always)]
     fn policy(&self, info: &Self::I, target: &Self::E) -> crate::Probability {
         let choices = info.choices();
@@ -306,7 +306,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             self.exploration()
         }
     }
-}
+} */
 
 #[cfg(feature = "native")]
 impl crate::save::upload::Table for Profile {
