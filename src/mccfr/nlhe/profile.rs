@@ -281,7 +281,7 @@ impl crate::save::disk::Disk for Profile {
         let file = File::create(path).expect(&format!("Failed to create file at {}", path_str));
         let buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
         let mut writer = ZEncoder::new(buf_writer, 0).expect("zstd encoder");
-        let _ = writer.multithread(2 as u32);
+        writer.multithread(2 as u32).expect("failed to set multithreading");
         let total_buckets = self.encounters.len();
         log::info!("Saving blueprint to {} ({} info-sets)", path_str, total_buckets);
 

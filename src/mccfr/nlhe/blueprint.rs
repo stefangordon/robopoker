@@ -55,11 +55,7 @@ impl Blueprint for super::solver::NLHE {
 
         let total_iters = <Self as crate::mccfr::traits::blueprint::Blueprint>::iterations();
 
-        // ------------------------------------------------------------
-        // Persist intermediate results periodically so that long runs
-        // can resume without losing more than ~100k / batch_size iters.
-        // ------------------------------------------------------------
-        const SAVE_TARGET_RAW: usize = 100_000;
+        const SAVE_TARGET_RAW: usize = 250_000;
         let save_interval = (SAVE_TARGET_RAW / Self::batch_size()).max(1);
 
         log::info!("Starting training: {} iterations", total_iters);
