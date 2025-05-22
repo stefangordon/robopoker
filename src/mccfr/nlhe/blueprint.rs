@@ -150,12 +150,21 @@ impl Blueprint for super::solver::NLHE {
 
                             // Update in-place
                             let updated_policy = (current_policy * discount_p + delta_p).max(crate::POLICY_MIN);
-                            entry.1 = (current_regret * discount_r + delta_r).max(crate::REGRET_MIN);
+                            let updated_regret = (current_regret * discount_r + delta_r)
+                                .clamp(crate::REGRET_MIN, crate::REGRET_MAX);
+                            entry.1 = updated_regret;
                             entry.0 = f16::from_f32(updated_policy);
                         } else {
                             // No existing record; create new using discounts on zero
-                            let new_regret = (0.0 * discount_none + delta_r).max(crate::REGRET_MIN);
+                            let new_regret = (0.0 * discount_none + delta_r).clamp(crate::REGRET_MIN, crate::REGRET_MAX);
                             let new_policy = (0.0 * discount_none + delta_p).max(crate::POLICY_MIN);
+                            #[cfg(debug_assertions)]
+                            debug_assert!(
+                                bucket.iter().all(|(e, _)| *e != edge),
+                                "duplicate edge {:?} detected in infoset {:?}",
+                                edge,
+                                info
+                            );
                             bucket.push((edge, (f16::from_f32(new_policy), new_regret)));
                         }
                     }

@@ -58,6 +58,11 @@ impl Profile {
         let mut regret_min = INFINITY;
         let mut regret_max = NEG_INFINITY;
 
+        // Distribution tracking
+        let mut regret_buckets = [0usize; 8]; // [-inf, -1M, -10k, -100, 0, 100, 10k, 1M, inf]
+        let mut policy_buckets = [0usize; 5]; // [0, 1, 10, 100, inf]
+        let mut zero_regret_count = 0usize;
+
         for bucket_entry in self.encounters.iter() {
             infosets += 1;
             let bucket = bucket_entry.value().lock();
@@ -72,6 +77,40 @@ impl Profile {
                 policy_max = policy_max.max(pol_f32);
                 regret_min = regret_min.min(*regret);
                 regret_max = regret_max.max(*regret);
+
+                // Bucket regrets
+                if *regret == 0.0 {
+                    zero_regret_count += 1;
+                } else if *regret < -1_000_000.0 {
+                    regret_buckets[0] += 1;
+                } else if *regret < -10_000.0 {
+                    regret_buckets[1] += 1;
+                } else if *regret < -100.0 {
+                    regret_buckets[2] += 1;
+                } else if *regret < 0.0 {
+                    regret_buckets[3] += 1;
+                } else if *regret < 100.0 {
+                    regret_buckets[4] += 1;
+                } else if *regret < 10_000.0 {
+                    regret_buckets[5] += 1;
+                } else if *regret < 1_000_000.0 {
+                    regret_buckets[6] += 1;
+                } else {
+                    regret_buckets[7] += 1;
+                }
+
+                // Bucket policies
+                if pol_f32 < 1.0 {
+                    policy_buckets[0] += 1;
+                } else if pol_f32 < 10.0 {
+                    policy_buckets[1] += 1;
+                } else if pol_f32 < 100.0 {
+                    policy_buckets[2] += 1;
+                } else if pol_f32 < 1000.0 {
+                    policy_buckets[3] += 1;
+                } else {
+                    policy_buckets[4] += 1;
+                }
             }
         }
 
@@ -86,6 +125,23 @@ impl Profile {
         log::info!("Edges / set:   min {}  max {}  avg {:.2}", min_edges, max_edges, avg_edges);
         log::info!("Policy range:  [{:.4}, {:.4}]", policy_min, policy_max);
         log::info!("Regret range:  [{:.4}, {:.4}]", regret_min, regret_max);
+        log::info!("Zero regrets:  {} ({:.2}% of edges)", zero_regret_count,
+                   100.0 * zero_regret_count as f64 / total_edges as f64);
+        log::info!("Regret distribution:");
+        log::info!("  < -1M:       {} edges", regret_buckets[0]);
+        log::info!("  [-1M, -10k): {} edges", regret_buckets[1]);
+        log::info!("  [-10k, -100): {} edges", regret_buckets[2]);
+        log::info!("  [-100, 0):   {} edges", regret_buckets[3]);
+        log::info!("  [0, 100):    {} edges", regret_buckets[4]);
+        log::info!("  [100, 10k):  {} edges", regret_buckets[5]);
+        log::info!("  [10k, 1M):   {} edges", regret_buckets[6]);
+        log::info!("  >= 1M:       {} edges", regret_buckets[7]);
+        log::info!("Policy weight distribution:");
+        log::info!("  [0, 1):      {} edges", policy_buckets[0]);
+        log::info!("  [1, 10):     {} edges", policy_buckets[1]);
+        log::info!("  [10, 100):   {} edges", policy_buckets[2]);
+        log::info!("  [100, 1k):   {} edges", policy_buckets[3]);
+        log::info!("  >= 1k:       {} edges", policy_buckets[4]);
         log::info!("-----------------------------------------------------");
     }
 }
@@ -169,6 +225,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             .collect()
     }
 
+    // Reinstate optimized methods with POLICY_MIN clamping
     #[inline(always)]
     fn policy(&self, info: &Self::I, target: &Self::E) -> crate::Probability {
         let choices = info.choices();
@@ -191,7 +248,6 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             }
             numer / denom
         } else {
-            // No bucket yet; uniform minimum probability over choices
             1.0 / choices.len() as crate::Probability
         }
     }
@@ -235,7 +291,8 @@ impl crate::mccfr::traits::profile::Profile for Profile {
                 let w = bucket
                     .iter()
                     .find_map(|(e, (pol, _))| if e == edge { Some(f32::from(*pol)) } else { None })
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.0)
+                    .max(crate::POLICY_MIN);
                 if edge == target {
                     numer = w;
                 }
