@@ -96,7 +96,9 @@ pub trait Arbitrary {
 #[cfg(feature = "native")]
 pub fn progress(n: usize) -> indicatif::ProgressBar {
     let tick = std::time::Duration::from_secs(60);
-    let style = "{spinner:.cyan} {elapsed} ~ {percent:>3}% {wide_bar:.cyan}";
+    // Show items per second throughput in addition to elapsed time, percent and bar.
+    // The long tick interval (60s) limits redraw frequency to reduce overhead.
+    let style = "{spinner:.cyan} [{pos}/{len}] {elapsed} @ {per_sec:>12} ~ {percent:>3}% {wide_bar:.cyan}";
     let style = indicatif::ProgressStyle::with_template(style).unwrap();
     let progress = indicatif::ProgressBar::new(n as u64);
     progress.set_style(style);

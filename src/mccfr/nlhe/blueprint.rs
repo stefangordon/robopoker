@@ -60,8 +60,14 @@ impl Blueprint for super::solver::NLHE {
 
         log::info!("Starting training: {} iterations", total_iters);
 
+        // Initialize progress bar (native targets only). The long tick interval ensures
+        // updates are throttled and do not add noticeable overhead to the solver.
+        #[cfg(feature = "native")]
+        let progress = crate::progress(total_iters);
+
         'training: for i in 0..total_iters {
-            log::info!("Training progress: {}/{}", i + 1, total_iters);
+            #[cfg(feature = "native")]
+            progress.inc(1);
 
             // Periodic checkpoint
             if (i + 1) % save_interval == 0 {
@@ -145,6 +151,13 @@ impl Blueprint for super::solver::NLHE {
             if self.interrupted() {
                 break 'training;
             }
+        }
+
+        // Finalize progress bar once training ends or is interrupted.
+        #[cfg(feature = "native")]
+        {
+            progress.finish();
+            println!();
         }
 
         self
