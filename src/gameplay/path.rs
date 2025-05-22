@@ -73,21 +73,20 @@ impl Iterator for Path {
 
 impl std::iter::FromIterator<Edge> for Path {
     fn from_iter<T: IntoIterator<Item = Edge>>(iter: T) -> Self {
-        let edges = iter.into_iter().collect::<Vec<_>>();
-        assert!(
-            edges.len() <= crate::MAX_DEPTH_SUBGAME,
-            "max depth exceeded: {} {:?}",
-            crate::MAX_DEPTH_SUBGAME,
-            edges,
-        );
-        edges
-            .into_iter()
-            .map(u8::from)
-            .map(|byte| byte as u64)
-            .enumerate()
-            .map(|(i, byte)| byte << (i * 4))
-            .fold(0u64, |acc, bits| acc | bits)
-            .into()
+        let mut bits: u64 = 0;
+        let mut idx = 0usize;
+        for edge in iter {
+            if idx >= crate::MAX_DEPTH_SUBGAME {
+                panic!(
+                    "max depth exceeded: {} (received at least this many edges)",
+                    crate::MAX_DEPTH_SUBGAME,
+                );
+            }
+            let nibble: u64 = u8::from(edge) as u64;
+            bits |= nibble << (idx * 4);
+            idx += 1;
+        }
+        Path(bits)
     }
 }
 

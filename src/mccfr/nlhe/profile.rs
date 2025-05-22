@@ -16,21 +16,23 @@ use crate::mccfr::traits::info::Info as InfoTrait;
 use smallvec::SmallVec;
 use std::path::PathBuf;
 use std::io::BufWriter;
+use ahash::RandomState;
+use half::f16;
 
-// Using SmallVec (inline capacity 8) instead of a per-infoset HashMap dramatically
-// reduces overhead. The majority of infosets have ≤8 edges.
-type Bucket = SmallVec<[(Edge, (crate::Probability, crate::Utility)); 8]>;
+// Using SmallVec (inline capacity 4) instead of a per-infoset HashMap dramatically
+// reduces overhead. The majority of infosets have ≤4 edges.
+type Bucket = SmallVec<[(Edge, (f16, crate::Utility)); 4]>;
 
 pub struct Profile {
     pub(super) iterations: usize,
-    pub(super) encounters: DashMap<Info, Mutex<Bucket>>,
+    pub(super) encounters: DashMap<Info, Mutex<Bucket>, RandomState>,
 }
 
 impl Default for Profile {
     fn default() -> Self {
         Self {
             iterations: 0,
-            encounters: DashMap::new(),
+            encounters: DashMap::with_hasher(RandomState::default()),
         }
     }
 }
@@ -65,8 +67,9 @@ impl Profile {
             max_edges = max_edges.max(count);
 
             for (_, (policy, regret)) in bucket.iter() {
-                policy_min = policy_min.min(*policy);
-                policy_max = policy_max.max(*policy);
+                let pol_f32 = f32::from(*policy);
+                policy_min = policy_min.min(pol_f32);
+                policy_max = policy_max.max(pol_f32);
                 regret_min = regret_min.min(*regret);
                 regret_max = regret_max.max(*regret);
             }
@@ -110,7 +113,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             let bucket = bucket_mutex.value().lock();
             bucket
                 .iter()
-                .find_map(|(e, (p, _))| if e == edge { Some(*p) } else { None })
+                .find_map(|(e, (p, _))| if e == edge { Some(f32::from(*p)) } else { None })
                 .unwrap_or_default()
         } else {
             0.0
@@ -164,6 +167,87 @@ impl crate::mccfr::traits::profile::Profile for Profile {
         regrets_vec
             .into_iter()
             .collect()
+    }
+
+    #[inline(always)]
+    fn policy(&self, info: &Self::I, target: &Self::E) -> crate::Probability {
+        let choices = info.choices();
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().lock();
+
+            let mut numer = crate::POLICY_MIN;
+            let mut denom = 0.0;
+            for edge in choices.iter() {
+                let r = bucket
+                    .iter()
+                    .find_map(|(e, (_, reg))| if e == edge { Some(*reg) } else { None })
+                    .unwrap_or(0.0)
+                    .max(crate::POLICY_MIN);
+                if edge == target {
+                    numer = r;
+                }
+                denom += r;
+            }
+            numer / denom
+        } else {
+            // No bucket yet; uniform minimum probability over choices
+            1.0 / choices.len() as crate::Probability
+        }
+    }
+
+    #[inline(always)]
+    fn advice(&self, info: &Self::I, target: &Self::E) -> crate::Probability {
+        let choices = info.choices();
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().lock();
+
+            let mut numer = crate::POLICY_MIN;
+            let mut denom = 0.0;
+            for edge in choices.iter() {
+                let p = bucket
+                    .iter()
+                    .find_map(|(e, (pol, _))| if e == edge { Some(f32::from(*pol)) } else { None })
+                    .unwrap_or(0.0)
+                    .max(crate::POLICY_MIN);
+                if edge == target {
+                    numer = p;
+                }
+                denom += p;
+            }
+            numer / denom
+        } else {
+            1.0 / choices.len() as crate::Probability
+        }
+    }
+
+    #[inline(always)]
+    fn sample(&self, info: &Self::I, target: &Self::E) -> crate::Probability {
+        let choices = info.choices();
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().lock();
+
+            let mut numer = crate::POLICY_MIN;
+            let mut denom = 0.0;
+            for edge in choices.iter() {
+                let w = bucket
+                    .iter()
+                    .find_map(|(e, (pol, _))| if e == edge { Some(f32::from(*pol)) } else { None })
+                    .unwrap_or(0.0);
+                if edge == target {
+                    numer = w;
+                }
+                denom += w;
+            }
+
+            let denom = self.activation() + denom;
+            let numer = self.activation() + numer * self.threshold();
+            (numer / denom).max(self.exploration())
+        } else {
+            self.exploration()
+        }
     }
 }
 
@@ -275,7 +359,7 @@ impl crate::save::disk::Disk for Profile {
             reader.read_exact(&mut skip).expect("skip pgcopy header");
         }
 
-        let encounters: DashMap<Info, Mutex<Bucket>> = DashMap::new();
+        let encounters: DashMap<Info, Mutex<Bucket>, RandomState> = DashMap::with_hasher(RandomState::default());
         let mut header = [0u8; 2];
         let mut record = [0u8; RECORD_SIZE - 2]; // we already read the 2-byte header separately
 
@@ -315,7 +399,7 @@ impl crate::save::disk::Disk for Profile {
                 .entry(bucket)
                 .or_insert_with(|| Mutex::new(SmallVec::new()));
             let mut bucket = bucket_mutex.lock();
-            bucket.push((edge, (policy, regret)));
+            bucket.push((edge, (f16::from_f32(policy), regret)));
         }
 
         Self {
@@ -373,7 +457,7 @@ impl crate::save::disk::Disk for Profile {
                 writer.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
                 writer.write_f32::<BE>(memory.1).unwrap();
                 writer.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
-                writer.write_f32::<BE>(memory.0).unwrap();
+                writer.write_f32::<BE>(f32::from(memory.0)).unwrap();
             }
 
             // Track progress by buckets, not individual edges
@@ -407,7 +491,7 @@ impl Profile {
                 let edge = Edge::random();
                 let policy: f32 = rand::thread_rng().gen_range(0.0..1.0);
                 let regret: f32 = rand::thread_rng().gen_range(-1.0..1.0);
-                bucket.push((edge, (policy, regret)));
+                bucket.push((edge, (f16::from_f32(policy), regret)));
             }
         }
 

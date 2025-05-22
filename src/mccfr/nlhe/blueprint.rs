@@ -1,5 +1,8 @@
 use crate::mccfr::traits::blueprint::Blueprint;
 use crate::mccfr::traits::profile::Profile;
+use crate::save::disk::Disk;
+use rustc_hash::FxHashMap;
+use half::f16;
 
 impl Blueprint for super::solver::NLHE {
     type T = super::turn::Turn;
@@ -49,9 +52,6 @@ impl Blueprint for super::solver::NLHE {
     // serial merge step in the default implementation.
     fn solve(mut self) -> Self {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        use rustc_hash::FxHashMap;
-        #[cfg(feature = "native")]
-        use crate::save::disk::Disk;
         use std::time::{Duration, Instant};
 
         let total_iters = <Self as crate::mccfr::traits::blueprint::Blueprint>::iterations();
@@ -135,7 +135,7 @@ impl Blueprint for super::solver::NLHE {
                         // Search for edge record
                         if let Some((_, entry)) = bucket.iter_mut().find(|(e, _)| *e == edge) {
                             // Current values
-                            let current_policy = entry.0;
+                            let current_policy = f32::from(entry.0);
                             let current_regret = entry.1;
 
                             // Discounts (cached)
@@ -149,13 +149,14 @@ impl Blueprint for super::solver::NLHE {
                             let discount_p = discount_none;
 
                             // Update in-place
+                            let updated_policy = (current_policy * discount_p + delta_p).max(crate::POLICY_MIN);
                             entry.1 = (current_regret * discount_r + delta_r).max(crate::REGRET_MIN);
-                            entry.0 = (current_policy * discount_p + delta_p).max(crate::POLICY_MIN);
+                            entry.0 = f16::from_f32(updated_policy);
                         } else {
                             // No existing record; create new using discounts on zero
                             let new_regret = (0.0 * discount_none + delta_r).max(crate::REGRET_MIN);
                             let new_policy = (0.0 * discount_none + delta_p).max(crate::POLICY_MIN);
-                            bucket.push((edge, (new_policy, new_regret)));
+                            bucket.push((edge, (f16::from_f32(new_policy), new_regret)));
                         }
                     }
                 });
