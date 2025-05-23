@@ -18,6 +18,9 @@ async fn main() {
     if arguments.analyze {
         crate::analysis::Server::run().await.unwrap();
     }
+    if arguments.evaluate {
+        crate::mccfr::exploitability::evaluate().await;
+    }
 }
 
 /*

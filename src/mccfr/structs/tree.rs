@@ -58,6 +58,12 @@ where
         assert!(edge.index() == tail.index() - 1);
         self.at(tail)
     }
+    /// Clear the tree for reuse, keeping allocated capacity
+    pub fn clear(&mut self) {
+        self.graph.clear();
+        self.arena.clear();
+        self.map.clear();
+    }
     /// group non-leaf Nodes by Info into InfoSets
     pub fn partition(self) -> FxHashMap<I, InfoSet<T, E, G, I>> {
         let tree = std::sync::Arc::new(self);

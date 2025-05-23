@@ -12,6 +12,8 @@
 //! generic infrastructure (`structs`, `traits`, `types`) that can be reused for
 //! implementing CFR on any extensive-form game with perfect recall.
 
+#[cfg(feature = "native")]
+pub mod exploitability;
 pub mod nlhe;
 pub mod rps;
 pub mod structs;

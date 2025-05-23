@@ -57,7 +57,7 @@ const CFR_TREE_COUNT_RPS: usize = 8192;
 
 /// checkpointing interval (in hours) for periodic profile saves during training
 #[cfg(feature = "native")]
-pub const CHECKPOINT_HOURS: u64 = 4;
+pub const CHECKPOINT_HOURS: u64 = 6;
 
 // nlhe mccfr parameters
 const CFR_BATCH_SIZE_NLHE: usize = 128;
@@ -90,6 +90,9 @@ pub struct Args {
     /// Run the analysis server
     #[arg(long)]
     pub analyze: bool,
+    /// Run exploitability evaluation
+    #[arg(long)]
+    pub evaluate: bool,
 }
 
 /// trait for random generation, mainly (strictly?) for testing
