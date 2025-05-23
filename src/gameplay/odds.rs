@@ -61,10 +61,9 @@ impl Odds {
         Self(3, 2), // 1.50
         Self(2, 1), // 2.00
     ];
-    pub const LAST_RAISES: [Self; 3] = [
+    pub const LAST_RAISES: [Self; 2] = [
         Self(1, 1), // 1.00
         Self(3, 2), // 1.50
-        Self(2, 1), // 2.00
     ];
 }
 
