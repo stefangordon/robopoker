@@ -168,10 +168,16 @@ pub trait Profile {
                 for (idx, root) in roots.iter().enumerate() {
                     let cfactual = self.cfactual_value(root, &edge);
                     let expected = expected_by_root[idx];
+
+                    debug_assert!(!cfactual.is_nan(), "cfactual_value produced NaN for edge {:?}", edge);
+                    debug_assert!(!expected.is_nan(), "expected_value produced NaN");
+                    debug_assert!(!cfactual.is_infinite(), "cfactual_value produced infinity for edge {:?}", edge);
+                    debug_assert!(!expected.is_infinite(), "expected_value produced infinity");
+
                     regret_sum += cfactual - expected;
                 }
-                debug_assert!(!regret_sum.is_nan());
-                debug_assert!(!regret_sum.is_infinite());
+                debug_assert!(!regret_sum.is_nan(), "regret_sum became NaN for edge {:?}", edge);
+                debug_assert!(!regret_sum.is_infinite(), "regret_sum became infinite for edge {:?}", edge);
                 (edge, regret_sum)
             })
             .collect::<Policy<Self::E>>()
@@ -217,11 +223,17 @@ pub trait Profile {
             .choices()
             .iter()
             .map(|e| self.sum_regret(info, e))
-            .inspect(|r| assert!(!r.is_nan()))
-            .inspect(|r| assert!(!r.is_infinite()))
+            .inspect(|r| assert!(!r.is_nan(), "regret value is NaN for edge in policy calculation"))
+            .inspect(|r| assert!(!r.is_infinite(), "regret value is infinite for edge in policy calculation"))
             .map(|r| r.max(crate::POLICY_MIN))
             .sum::<crate::Utility>();
-        numer / denom
+
+        debug_assert!(denom > 0.0, "denominator is zero or negative in policy calculation");
+        let result = numer / denom;
+        debug_assert!(!result.is_nan(), "policy calculation produced NaN: {} / {}", numer, denom);
+        debug_assert!(result >= 0.0 && result <= 1.0, "policy value out of bounds: {}", result);
+
+        result
     }
     /// calculate the HISTORICAL WEIGHTED AVERAGE decision
     /// strategy for this information.
@@ -323,10 +335,19 @@ pub trait Profile {
         &self,
         leaf: &Node<Self::T, Self::E, Self::G, Self::I>,
     ) -> crate::Probability {
-        leaf.into_iter()
+        let result = leaf.into_iter()
             .filter(|(parent, _)| self.walker() != parent.game().turn())
             .map(|(parent, incoming)| self.sample(parent.info(), &incoming))
             .product::<crate::Probability>()
+            .max(crate::POLICY_MIN); // Prevent underflow to zero
+
+        // In production builds, log warnings instead of panicking
+        #[cfg(not(debug_assertions))]
+        if result <= crate::POLICY_MIN {
+            log::warn!("sampling_reach underflowed to minimum value, this may indicate numerical instability after {} epochs", self.epochs());
+        }
+
+        result
     }
 
     // utility calculations
@@ -338,19 +359,20 @@ pub trait Profile {
         root: &Node<Self::T, Self::E, Self::G, Self::I>,
         leaf: &Node<Self::T, Self::E, Self::G, Self::I>,
     ) -> crate::Utility {
-        self.relative_reach(root, leaf) * leaf.game().payoff(root.game().turn())
-            / self.sampling_reach(leaf) // importance sampling
-                                        //
-                                        // this could be sped up by not recalculating
-                                        // the "sampling_reach" of root redundantly,
-                                        // since it contributes the same multiplicative
-                                        // reach probability factor to the sampling_reach
-                                        // of each leaf. instead, sampling_reach could get
-                                        // absorbed into relative_reach, while the common
-                                        // sampling_reach(root) distributes.
-                                        //
-                                        // i.e. sampling_reach(Node, Option<Node>) , where
-                                        // None indicates go back to tree root.
+        let reach = self.relative_reach(root, leaf);
+        let payoff = leaf.game().payoff(root.game().turn());
+        let sampling = self.sampling_reach(leaf);
+
+        debug_assert!(!reach.is_nan(), "relative_reach produced NaN");
+        debug_assert!(!payoff.is_nan(), "payoff produced NaN");
+        debug_assert!(!sampling.is_nan(), "sampling_reach produced NaN");
+        debug_assert!(sampling > 0.0, "sampling_reach is zero or negative: {}", sampling);
+
+        let result = reach * payoff / sampling;
+        debug_assert!(!result.is_nan(), "relative_value calculation produced NaN: {} * {} / {}", reach, payoff, sampling);
+        debug_assert!(!result.is_infinite(), "relative_value calculation produced infinity");
+
+        result
     }
     /// Assuming we start at root Node,
     /// and that we sample the Tree according to Profile,

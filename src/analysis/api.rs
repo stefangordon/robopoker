@@ -8,9 +8,11 @@ use crate::clustering::metric::Metric;
 use crate::clustering::pair::Pair;
 use crate::clustering::sinkhorn::Sinkhorn;
 use crate::gameplay::path::Path;
+use crate::gameplay::game::Game;
 use crate::transport::coupling::Coupling;
 use crate::Energy;
 use crate::Probability;
+use crate::Chips;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -801,6 +803,77 @@ use crate::gameplay::recall::Recall;
 // blueprint lookups
 impl API {
     pub async fn policy(&self, recall: Recall) -> Result<Vec<Decision>, E> {
+        let game = recall.head();
+        let street = game.street();
+        let pot = game.pot();
+
+        // Check if we should use subgame solving
+        if self.should_solve_subgame(street, pot, Self::stack_to_pot_ratio(&game)) {
+            return self.solve_subgame_unsafe(&recall).await;
+        }
+
+        // Otherwise use existing blueprint lookup
+        self.blueprint_policy(&recall).await
+    }
+
+    /// Determine if we should solve a subgame for this situation
+    fn should_solve_subgame(&self, street: Street, pot: Chips, spr: f32) -> bool {
+        match street {
+            Street::Rive => pot > 20, // Always solve river in big pots
+            Street::Turn => pot > 40 && spr < 2.0, // Solve turn in very big pots
+            _ => false, // Don't solve preflop/flop
+        }
+    }
+
+    /// Stack-to-pot ratio helper
+    fn stack_to_pot_ratio(game: &Game) -> f32 {
+        // Simplified SPR calculation
+        // In most cases, we can estimate based on starting stacks and pot size
+        let pot = game.pot() as f32;
+        if pot <= 0.0 {
+            return f32::INFINITY;
+        }
+
+        // Estimate remaining stack based on pot size
+        // Assuming 100BB starting stacks (200 chips)
+        let starting_stack = crate::STACK as f32;
+        let estimated_remaining = (starting_stack - pot / 2.0).max(0.0);
+
+        estimated_remaining / pot
+    }
+
+    /// Solve a subgame with enhanced action abstraction
+    async fn solve_subgame_unsafe(&self, recall: &Recall) -> Result<Vec<Decision>, E> {
+        use crate::mccfr::subgame::SubgameSolver;
+        
+        let game = recall.head();
+        log::info!(
+            "Solving subgame at {:?} with pot {} (SPR: {:.2})", 
+            game.street(), 
+            game.pot(),
+            Self::stack_to_pot_ratio(&game)
+        );
+        
+        // Get blueprint strategy for warm-start
+        let blueprint_strategy = self.blueprint_policy(recall).await?;
+        
+        // For now, use an empty abstraction lookup
+        // TODO: Load this from the database or encoder
+        let abstraction_lookup = std::collections::BTreeMap::new();
+        
+        // Use builder pattern for cleaner configuration
+        let solver = SubgameSolver::builder()
+            .with_game_state(game)
+            .with_warm_start(blueprint_strategy)
+            .with_iterations(500) // 5x minimum for better convergence
+            .with_abstraction_lookup(abstraction_lookup)
+            .build();
+            
+        Ok(solver.solve().await)
+    }
+
+    /// Original blueprint policy lookup (renamed from policy)
+    async fn blueprint_policy(&self, recall: &Recall) -> Result<Vec<Decision>, E> {
         const SQL: &'static str = r#"
         -- policy is indexed by present, past, future
         -- and it returns a vector of decision probabilities
