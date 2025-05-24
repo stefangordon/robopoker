@@ -11,7 +11,8 @@ use crate::mccfr::types::policy::Policy;
 use crate::mccfr::traits::info::Info as InfoTrait;
 use smallvec::SmallVec;
 use std::path::PathBuf;
-use ahash::RandomState;
+use rustc_hash::FxHasher;
+use std::hash::BuildHasher;
 use half::f16;
 #[cfg(feature = "native")]
 use memmap2::MmapOptions;
@@ -46,14 +47,14 @@ type Bucket = SmallVec<[(Edge, (f16, crate::Utility)); 4]>;
 
 pub struct Profile {
     pub(super) iterations: usize,
-    pub(super) encounters: DashMap<Info, Mutex<Bucket>, RandomState>,
+    pub(super) encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher>,
 }
 
 impl Default for Profile {
     fn default() -> Self {
         Self {
             iterations: 0,
-            encounters: DashMap::with_hasher(RandomState::default()),
+            encounters: DashMap::with_hasher(FxBuildHasher::default()),
         }
     }
 }
@@ -489,8 +490,8 @@ impl Profile {
         log::info!("Loading {} records from memory-mapped file", total_records);
 
         // Pre-allocate with estimated capacity for better performance
-        let encounters: DashMap<Info, Mutex<Bucket>, RandomState> =
-            DashMap::with_capacity_and_hasher(total_records / 4, RandomState::default());
+        let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> =
+            DashMap::with_capacity_and_hasher(total_records / 4, FxBuildHasher::default());
 
         let log_every_n = (total_records / 100).max(1);
         let mut records_processed = 0;
@@ -558,7 +559,7 @@ impl Profile {
         let mut skip = [0u8; PGCOPY_HEADER_SIZE];
         reader.read_exact(&mut skip).expect("Failed to skip pgcopy header");
 
-        let encounters: DashMap<Info, Mutex<Bucket>, RandomState> = DashMap::with_hasher(RandomState::default());
+        let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> = DashMap::with_hasher(FxBuildHasher::default());
         let mut header = [0u8; 2];
         let mut record = [0u8; PGCOPY_RECORD_SIZE - 2]; // 2-byte header already consumed + 64 payload
 
@@ -604,5 +605,17 @@ impl Profile {
             encounters,
             iterations: 0,
         }
+    }
+}
+
+/// Custom BuildHasher for FxHasher
+#[derive(Clone, Default)]
+pub struct FxBuildHasher;
+
+impl BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        FxHasher::default()
     }
 }
