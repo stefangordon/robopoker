@@ -290,7 +290,7 @@ impl crate::save::upload::Table for Profile {
             future     BIGINT,
             policy     REAL,
             regret     REAL
-        );
+        ) WITH (autovacuum_enabled = false);
         "
         .to_string()
     }
