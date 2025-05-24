@@ -1,5 +1,5 @@
 use clap::Parser;
-use robopoker::*;
+use robopokerlib::*;
 
 #[tokio::main]
 async fn main() {
@@ -20,6 +20,9 @@ async fn main() {
     }
     if arguments.evaluate {
         crate::mccfr::exploitability::evaluate().await;
+    }
+    if arguments.generatepgdata {
+        crate::save::Converter::generate_pg_data();
     }
 }
 

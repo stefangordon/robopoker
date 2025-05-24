@@ -19,6 +19,7 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::Client;
 use tokio_postgres::Error as E;
 use futures::pin_mut;
+use zstd::stream::Decoder as ZDecoder;
 
 pub struct Writer(Arc<Client>);
 
@@ -106,22 +107,35 @@ impl Writer {
         let cols = T::columns().len();
         let mut buffer: Vec<Vec<Field>> = Vec::with_capacity(BATCH);
 
-        // --- progress tracking -------------------------------------------------
-        let total_bytes: u64 = T::sources()
-            .iter()
-            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-            .sum();
-        let mut processed_bytes: u64 = 0;
-        let mut last_pct: u64 = 0;
-        // ----------------------------------------------------------------------
+        // Simple progress tracking for batches (works for both compressed and uncompressed)
+        let mut batch_count: usize = 0;
 
         let mut tag = [0u8; 2];
 
         for src in T::sources() {
-            let mut reader = BufReader::new(File::open(src).expect("file not found"));
-            reader.seek(SeekFrom::Start(19)).unwrap(); // skip binary header
+            // Detect zstd compression by checking magic bytes
+            let mut magic = [0u8; 4];
+            let mut file_for_magic = File::open(&src).expect("file not found");
+            let _ = file_for_magic.read_exact(&mut magic);
+            file_for_magic.seek(SeekFrom::Start(0)).unwrap();
+            
+            // Create appropriate reader based on compression detection
+            let reader_inner: Box<dyn Read> = if magic == [0x28, 0xB5, 0x2F, 0xFD] {
+                log::debug!("Detected zstd compression in file: {}", src);
+                Box::new(ZDecoder::new(file_for_magic).expect("zstd decode"))
+            } else {
+                log::debug!("Using uncompressed file: {}", src);
+                Box::new(file_for_magic)
+            };
+            
+            let mut reader = BufReader::new(reader_inner);
+            
+            // Skip the 19-byte PostgreSQL binary header
+            // For zstd streams, we read and discard since they don't support seeking
+            let mut skip = [0u8; 19];
+            reader.read_exact(&mut skip).expect("skip pgcopy header");
 
-            let file_start = processed_bytes; // bytes processed so far before this file
+
 
             loop {
                 if let Err(_) = reader.read_exact(&mut tag) {
@@ -165,15 +179,7 @@ impl Writer {
 
                 buffer.push(row);
 
-                // Progress: use current stream position
-                if let Ok(pos) = reader.stream_position() {
-                    processed_bytes = file_start + pos;
-                    let pct = processed_bytes.saturating_mul(100) / total_bytes.max(1);
-                    if pct >= last_pct + 1 {
-                        last_pct = pct;
-                        log::info!("COPY progress: {}%", pct);
-                    }
-                }
+
 
                 if buffer.len() == BATCH {
                     for row in &buffer {
@@ -181,6 +187,12 @@ impl Writer {
                     }
                     // rows are sent immediately; buffer cleared to keep memory bounded
                     buffer.clear();
+                    
+                    // Progress tracking
+                    batch_count += 1;
+                    if batch_count % 100 == 0 {
+                        log::info!("COPY progress: {} batches processed", batch_count);
+                    }
                 }
             }
         }

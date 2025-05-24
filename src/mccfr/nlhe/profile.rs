@@ -3,21 +3,42 @@ use super::game::Game;
 use super::info::Info;
 use super::turn::Turn;
 use crate::cards::street::Street;
-use std::io::Write;
-use std::fs::File;
-use std::mem::size_of;
 use crate::Arbitrary;
-use zstd::stream::{Encoder as ZEncoder, Decoder as ZDecoder};
-use std::io::Seek;
+use zstd::stream::Decoder as ZDecoder;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use crate::mccfr::types::policy::Policy;
 use crate::mccfr::traits::info::Info as InfoTrait;
 use smallvec::SmallVec;
 use std::path::PathBuf;
-use std::io::BufWriter;
 use ahash::RandomState;
 use half::f16;
+#[cfg(feature = "native")]
+use memmap2::MmapOptions;
+
+// File format constants and specifications
+//
+// Two formats are supported:
+// 1. Legacy: zstd-compressed PostgreSQL binary COPY format (detected by zstd magic bytes)
+// 2. Current: Uncompressed memory-mapped binary format (default for new saves)
+//
+// Legacy Format: [zstd header][19-byte PG header][records...][trailer]
+// Current Format: [8-byte record count][40-byte records...]
+//
+// Current format record layout (little-endian):
+// - history: 8 bytes (u64)
+// - present: 8 bytes (u64)
+// - futures: 8 bytes (u64)
+// - edge: 8 bytes (u64)
+// - regret: 4 bytes (f32)
+// - policy: 4 bytes (f32)
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+const MMAP_RECORD_SIZE: usize = 40; // 8+8+8+8+4+4 bytes per record
+const MMAP_HEADER_SIZE: usize = 8; // record count header
+const PGCOPY_RECORD_SIZE: usize = 66; // 2-byte header already consumed + 64 payload
+const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
+const CHUNK_SIZE: usize = 1000; // Processing chunk size for better cache performance
 
 // Using SmallVec (inline capacity 4) instead of a per-infoset HashMap dramatically
 // reduces overhead. The majority of infosets have ≤4 edges.
@@ -302,148 +323,33 @@ impl crate::save::disk::Disk for Profile {
     }
 
     fn load(_: Street) -> Self {
-        use crate::clustering::abstraction::Abstraction;
-        use crate::gameplay::path::Path;
-        use crate::mccfr::nlhe::info::Info;
-        use byteorder::{ByteOrder, BE};
         use std::fs::File;
-        use std::io::{BufReader, Read};
-
-        const RECORD_SIZE: usize = 66; // 2-byte header already consumed + 64 payload
+        use std::io::Read;
 
         let path = Self::path(Street::random());
         log::info!("{:<32}{:<32}", "loading     blueprint", path);
 
-        let _file = File::open(&path).expect("open blueprint file");
-        // Detect zstd magic (0x28 B5 2F FD)
+        // Detect format by checking for zstd magic bytes
         let mut magic = [0u8; 4];
-        let mut file_for_magic = std::fs::File::open(&path).expect("open");
-        let _ = file_for_magic.read_exact(&mut magic);
-        file_for_magic.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let reader_inner: Box<dyn Read> = if magic == [0x28, 0xB5, 0x2F, 0xFD] {
-            Box::new(ZDecoder::new(file_for_magic).expect("zstd decode"))
+        let mut file = File::open(&path).expect("Failed to open blueprint file");
+        file.read_exact(&mut magic).expect("Failed to read file header");
+
+        if magic == ZSTD_MAGIC {
+            log::debug!("Detected zstd-compressed PostgreSQL binary format (legacy)");
+            Self::load_legacy_pgcopy()
         } else {
-            Box::new(file_for_magic)
-        };
-
-        let mut reader = BufReader::with_capacity(1024 * 1024, reader_inner);
-
-        // Skip the 19-byte PG binary COPY header that precedes the first record
-        {
-            let mut skip = [0u8; 19];
-            reader.read_exact(&mut skip).expect("skip pgcopy header");
-        }
-
-        let encounters: DashMap<Info, Mutex<Bucket>, RandomState> = DashMap::with_hasher(RandomState::default());
-        let mut header = [0u8; 2];
-        let mut record = [0u8; RECORD_SIZE - 2]; // we already read the 2-byte header separately
-
-        loop {
-            if reader.read_exact(&mut header).is_err() {
-                break; // EOF
-            }
-            let fields = u16::from_be_bytes(header);
-            if fields == 0xFFFF {
-                break; // trailer
-            }
-            debug_assert_eq!(fields, 6, "unexpected field count {}", fields);
-
-            // Read remaining 64 bytes of the record in one shot
-            reader.read_exact(&mut record).expect("record bytes");
-
-            // Offsets inside `record`
-            let mut offset = 0;
-            // helper closures
-            let mut read_len = |size: usize| {
-                offset += 4; // skip length prefix (we trust it)
-                let start = offset;
-                let end = offset + size;
-                offset = end;
-                &record[start..end]
-            };
-
-            let history = Path::from(BE::read_u64(read_len(8)));
-            let present = Abstraction::from(BE::read_u64(read_len(8)));
-            let futures = Path::from(BE::read_u64(read_len(8)));
-            let edge = Edge::from(BE::read_u64(read_len(8)));
-            let regret = BE::read_f32(read_len(4));
-            let policy = BE::read_f32(read_len(4));
-
-            let bucket = Info::from((history, present, futures));
-            let bucket_mutex = encounters
-                .entry(bucket)
-                .or_insert_with(|| Mutex::new(SmallVec::new()));
-            let mut bucket = bucket_mutex.lock();
-            bucket.push((edge, (f16::from_f32(policy), regret)));
-        }
-
-        Self {
-            encounters,
-            iterations: 0,
+            log::debug!("Detected new mmap binary format");
+            Self::load_mmap()
         }
     }
-    fn save(&self) {
-        // If caller only wants statistics, skip the expensive on-disk serialization.
+        fn save(&self) {
         if std::env::var("BLUEPRINT_STATS").is_ok() {
+            // If caller only wants statistics, skip expensive serialization
             self.log_stats();
-            return;
+        } else {
+            // Use optimized mmap format for all saves
+            self.save_mmap();
         }
-
-        const N_FIELDS: u16 = 6;
-        let path_str = Self::path(Street::random());
-        let path = std::path::Path::new(&path_str);
-
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("Failed to create parent directories");
-        }
-
-        let file = File::create(path).expect(&format!("Failed to create file at {}", path_str));
-        let buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
-        let mut writer = ZEncoder::new(buf_writer, 0).expect("zstd encoder");
-        writer.multithread(2 as u32).expect("failed to set multithreading");
-        let total_buckets = self.encounters.len();
-        log::info!("Saving blueprint to {} ({} info-sets)", path_str, total_buckets);
-
-        // For progress tracking
-        let mut processed_buckets = 0;
-        let buckets_one_percent = total_buckets / 100;
-        // Ensure we'll log at least some progress messages
-        let log_every_n = if buckets_one_percent > 0 { buckets_one_percent } else { 1 };
-
-        use crate::Arbitrary;
-        use byteorder::WriteBytesExt;
-        use byteorder::BE;
-        log::info!("{:<32}{:<32}", "saving      blueprint", path_str);
-        writer.write_all(Self::header()).expect("header");
-        for bucket_entry in self.encounters.iter() {
-            let bucket = bucket_entry.key();
-            let edges = bucket_entry.value().lock();
-            for (edge, memory) in edges.iter() {
-                writer.write_u16::<BE>(N_FIELDS).unwrap();
-                writer.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                writer.write_u64::<BE>(u64::from(*bucket.history())).unwrap();
-                writer.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                writer.write_u64::<BE>(u64::from(*bucket.present())).unwrap();
-                writer.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                writer.write_u64::<BE>(u64::from(*bucket.futures())).unwrap();
-                writer.write_u32::<BE>(size_of::<u64>() as u32).unwrap();
-                writer.write_u64::<BE>(u64::from(edge.clone())).unwrap();
-                writer.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
-                writer.write_f32::<BE>(memory.1).unwrap();
-                writer.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
-                writer.write_f32::<BE>(f32::from(memory.0)).unwrap();
-            }
-
-            // Track progress by buckets, not individual edges
-            processed_buckets += 1;
-            if processed_buckets % log_every_n == 0 || processed_buckets == total_buckets {
-                let percentage = (processed_buckets * 100) / total_buckets;
-                log::info!("Saving blueprint progress: {}%", percentage);
-            }
-        }
-        writer.write_u16::<BE>(Self::footer()).expect("trailer");
-        writer.finish().expect("finish zstd");
     }
 }
 
@@ -472,5 +378,231 @@ impl Profile {
 
         // Update iterations counter to reflect synthetic data
         self.iterations += bucket_count;
+    }
+
+        /// Save profile data using memory-mapped I/O with the new binary format.
+    /// This is now the default save format. Maps a file into memory and writes directly to the mapped region.
+    #[cfg(feature = "native")]
+    pub fn save_mmap(&self) {
+        use byteorder::{ByteOrder, LittleEndian};
+        use crate::save::disk::Disk;
+        use std::fs::OpenOptions;
+
+        let path_str = Self::path(Street::random());
+        let path = std::path::Path::new(&path_str);
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("Failed to create parent directories");
+        }
+
+        // Calculate total records and file size
+        let total_records: usize = self.encounters.iter()
+            .map(|entry| entry.value().lock().len())
+            .sum();
+        let file_size = MMAP_HEADER_SIZE + (total_records * MMAP_RECORD_SIZE);
+
+        log::info!("Saving blueprint to {} ({} records, {} bytes)",
+                   path_str, total_records, file_size);
+
+        // Create and size the file
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect(&format!("Failed to create file at {}", path_str));
+
+        file.set_len(file_size as u64).expect("Failed to set file size");
+
+        // Memory map the file for writing
+        let mut mmap = unsafe {
+            MmapOptions::new()
+                .map_mut(&file)
+                .expect("Failed to mmap file for writing")
+        };
+
+        // Write header: total record count
+        LittleEndian::write_u64(&mut mmap[0..MMAP_HEADER_SIZE], total_records as u64);
+
+        // Write records directly to mapped memory
+        let mut offset = MMAP_HEADER_SIZE;
+        let mut written_records = 0;
+        let log_every_n = (total_records / 100).max(1);
+
+        for bucket_entry in self.encounters.iter() {
+            let bucket = bucket_entry.key();
+            let edges = bucket_entry.value().lock();
+
+            for (edge, (policy, regret)) in edges.iter() {
+                // Write record: history(8) + present(8) + futures(8) + edge(8) + regret(4) + policy(4)
+                LittleEndian::write_u64(&mut mmap[offset..offset+8], u64::from(*bucket.history()));
+                LittleEndian::write_u64(&mut mmap[offset+8..offset+16], u64::from(*bucket.present()));
+                LittleEndian::write_u64(&mut mmap[offset+16..offset+24], u64::from(*bucket.futures()));
+                LittleEndian::write_u64(&mut mmap[offset+24..offset+32], u64::from(edge.clone()));
+                LittleEndian::write_f32(&mut mmap[offset+32..offset+36], *regret);
+                LittleEndian::write_f32(&mut mmap[offset+36..offset+40], f32::from(*policy));
+
+                offset += MMAP_RECORD_SIZE;
+                written_records += 1;
+
+                if written_records % log_every_n == 0 || written_records == total_records {
+                    let percentage = (written_records * 100) / total_records;
+                    log::info!("Saving blueprint progress: {}%", percentage);
+                }
+            }
+        }
+
+        // Ensure data is flushed to disk
+        mmap.flush().expect("Failed to flush mmap");
+        log::info!("Completed saving {} records to {}", written_records, path_str);
+    }
+
+        /// Load profile data using memory-mapped I/O.
+    /// Maps the file into memory and reads directly from the mapped region.
+    #[cfg(feature = "native")]
+    pub fn load_mmap() -> Self {
+        use byteorder::{ByteOrder, LittleEndian};
+        use crate::clustering::abstraction::Abstraction;
+        use crate::gameplay::path::Path;
+        use std::fs::File;
+        use crate::save::disk::Disk;
+
+        let path_str = Self::path(Street::random());
+        log::info!("{:<32}{:<32}", "loading     blueprint", path_str);
+
+        let file = File::open(&path_str).expect(&format!("Failed to open blueprint file: {}", path_str));
+        let mmap = unsafe { MmapOptions::new().map(&file).expect("Failed to mmap file") };
+
+        // Validate file size and read header
+        if mmap.len() < MMAP_HEADER_SIZE {
+            panic!("File too small to contain header: {} bytes", mmap.len());
+        }
+        let total_records = LittleEndian::read_u64(&mmap[0..MMAP_HEADER_SIZE]) as usize;
+
+        let expected_size = MMAP_HEADER_SIZE + (total_records * MMAP_RECORD_SIZE);
+        if mmap.len() < expected_size {
+            panic!("File size mismatch: expected {} bytes, got {}", expected_size, mmap.len());
+        }
+
+        log::info!("Loading {} records from memory-mapped file", total_records);
+
+        // Pre-allocate with estimated capacity for better performance
+        let encounters: DashMap<Info, Mutex<Bucket>, RandomState> =
+            DashMap::with_capacity_and_hasher(total_records / 4, RandomState::default());
+
+        let log_every_n = (total_records / 100).max(1);
+        let mut records_processed = 0;
+
+        // Process records in chunks for better cache performance
+        for chunk_start in (0..total_records).step_by(CHUNK_SIZE) {
+            let chunk_end = (chunk_start + CHUNK_SIZE).min(total_records);
+
+            for i in chunk_start..chunk_end {
+                let record_offset = MMAP_HEADER_SIZE + (i * MMAP_RECORD_SIZE);
+
+                // Read record directly from mapped memory: history(8) + present(8) + futures(8) + edge(8) + regret(4) + policy(4)
+                let history = Path::from(LittleEndian::read_u64(&mmap[record_offset..record_offset+8]));
+                let present = Abstraction::from(LittleEndian::read_u64(&mmap[record_offset+8..record_offset+16]));
+                let futures = Path::from(LittleEndian::read_u64(&mmap[record_offset+16..record_offset+24]));
+                let edge = Edge::from(LittleEndian::read_u64(&mmap[record_offset+24..record_offset+32]));
+                let regret = LittleEndian::read_f32(&mmap[record_offset+32..record_offset+36]);
+                let policy = LittleEndian::read_f32(&mmap[record_offset+36..record_offset+40]);
+
+                let info = Info::from((history, present, futures));
+                let bucket_mutex = encounters
+                    .entry(info)
+                    .or_insert_with(|| Mutex::new(SmallVec::new()));
+                let mut bucket = bucket_mutex.lock();
+                bucket.push((edge, (f16::from_f32(policy), regret)));
+
+                records_processed += 1;
+            }
+
+            if records_processed % log_every_n == 0 || records_processed == total_records {
+                let percentage = (records_processed * 100) / total_records;
+                log::info!("Loading blueprint progress: {}%", percentage);
+            }
+        }
+
+        log::info!("Loaded {} records from memory-mapped file", total_records);
+
+        Self {
+            encounters,
+            iterations: 0,
+        }
+    }
+
+    /// Load profile data from legacy zstd-compressed PostgreSQL binary format files.
+    /// This method handles the original file format used before the mmap optimization.
+    #[cfg(feature = "native")]
+    fn load_legacy_pgcopy() -> Self {
+        use crate::clustering::abstraction::Abstraction;
+        use crate::gameplay::path::Path;
+        use crate::mccfr::nlhe::info::Info;
+        use byteorder::{ByteOrder, BE};
+        use std::fs::File;
+        use std::io::{BufReader, Read};
+        use crate::save::disk::Disk;
+
+        let path = Self::path(Street::random());
+        log::info!("{:<32}{:<32}", "loading     blueprint (legacy)", path);
+
+        // Open file and create zstd decoder (we know it's zstd compressed)
+        let file = File::open(&path).expect("Failed to open blueprint file");
+        let reader_inner = ZDecoder::new(file).expect("Failed to create zstd decoder");
+        let mut reader = BufReader::with_capacity(1024 * 1024, reader_inner);
+
+        // Skip the PostgreSQL binary COPY header
+        let mut skip = [0u8; PGCOPY_HEADER_SIZE];
+        reader.read_exact(&mut skip).expect("Failed to skip pgcopy header");
+
+        let encounters: DashMap<Info, Mutex<Bucket>, RandomState> = DashMap::with_hasher(RandomState::default());
+        let mut header = [0u8; 2];
+        let mut record = [0u8; PGCOPY_RECORD_SIZE - 2]; // 2-byte header already consumed + 64 payload
+
+        loop {
+            if reader.read_exact(&mut header).is_err() {
+                break; // EOF
+            }
+            let fields = u16::from_be_bytes(header);
+            if fields == 0xFFFF {
+                break; // trailer
+            }
+            debug_assert_eq!(fields, 6, "Unexpected field count: {}", fields);
+
+            // Read remaining bytes of the record
+            reader.read_exact(&mut record).expect("Failed to read record bytes");
+
+            // Parse PostgreSQL binary format record
+            let mut offset = 0;
+            let mut read_field = |size: usize| {
+                offset += 4; // skip length prefix
+                let start = offset;
+                let end = offset + size;
+                offset = end;
+                &record[start..end]
+            };
+
+            let history = Path::from(BE::read_u64(read_field(8)));
+            let present = Abstraction::from(BE::read_u64(read_field(8)));
+            let futures = Path::from(BE::read_u64(read_field(8)));
+            let edge = Edge::from(BE::read_u64(read_field(8)));
+            let regret = BE::read_f32(read_field(4));
+            let policy = BE::read_f32(read_field(4));
+
+            let info = Info::from((history, present, futures));
+            let bucket_mutex = encounters
+                .entry(info)
+                .or_insert_with(|| Mutex::new(SmallVec::new()));
+            let mut bucket = bucket_mutex.lock();
+            bucket.push((edge, (f16::from_f32(policy), regret)));
+        }
+
+        Self {
+            encounters,
+            iterations: 0,
+        }
     }
 }

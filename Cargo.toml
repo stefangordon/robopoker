@@ -44,8 +44,10 @@ parking_lot = "0.12"
 smallvec = "1.11"
 ahash = "0.8"
 half = "2.4"
+memmap2 = { version = "0.9", optional = true }
 
 [lib]
+name = "robopokerlib"
 crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
@@ -71,7 +73,8 @@ native = [
     "clap",
     "actix-web",
     "actix-cors",
-    "env_logger"
+    "env_logger",
+    "memmap2"
 ]
 
 [[bin]]
