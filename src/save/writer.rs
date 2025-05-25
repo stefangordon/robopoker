@@ -75,7 +75,7 @@ impl Writer {
             if name == "blueprint" {
                 self.stream_optimized::<T>().await?;
             } else {
-                self.stream::<T>().await?;
+            self.stream::<T>().await?;
             }
             
             // Create indices CONCURRENTLY for large tables to avoid locking
@@ -96,7 +96,7 @@ impl Writer {
                     }
                 }
             } else {
-                self.0.batch_execute(&T::indices()).await?;
+            self.0.batch_execute(&T::indices()).await?;
             }
             Ok(())
         } else {

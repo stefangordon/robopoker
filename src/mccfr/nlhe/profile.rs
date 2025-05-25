@@ -508,8 +508,10 @@ impl Profile {
                 let present = Abstraction::from(LittleEndian::read_u64(&mmap[record_offset+8..record_offset+16]));
                 let futures = Path::from(LittleEndian::read_u64(&mmap[record_offset+16..record_offset+24]));
                 let edge = Edge::from(LittleEndian::read_u64(&mmap[record_offset+24..record_offset+32]));
-                let regret = LittleEndian::read_f32(&mmap[record_offset+32..record_offset+36]);
-                let policy = LittleEndian::read_f32(&mmap[record_offset+36..record_offset+40]);
+                let regret_raw = LittleEndian::read_f32(&mmap[record_offset+32..record_offset+36]);
+                let policy_raw = LittleEndian::read_f32(&mmap[record_offset+36..record_offset+40]);
+                let regret = if regret_raw.is_finite() { regret_raw } else { 0.0 };
+                let policy = if policy_raw.is_finite() { policy_raw } else { 0.0 };
 
                 let info = Info::from((history, present, futures));
                 let bucket_mutex = encounters
@@ -590,8 +592,10 @@ impl Profile {
             let present = Abstraction::from(BE::read_u64(read_field(8)));
             let futures = Path::from(BE::read_u64(read_field(8)));
             let edge = Edge::from(BE::read_u64(read_field(8)));
-            let regret = BE::read_f32(read_field(4));
-            let policy = BE::read_f32(read_field(4));
+            let regret_raw = BE::read_f32(read_field(4));
+            let policy_raw = BE::read_f32(read_field(4));
+            let regret = if regret_raw.is_finite() { regret_raw } else { 0.0 };
+            let policy = if policy_raw.is_finite() { policy_raw } else { 0.0 };
 
             let info = Info::from((history, present, futures));
             let bucket_mutex = encounters

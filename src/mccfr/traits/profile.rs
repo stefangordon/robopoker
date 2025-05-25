@@ -368,9 +368,15 @@ pub trait Profile {
         debug_assert!(!sampling.is_nan(), "sampling_reach produced NaN");
         debug_assert!(sampling > 0.0, "sampling_reach is zero or negative: {}", sampling);
 
-        let result = reach * payoff / sampling;
-        debug_assert!(!result.is_nan(), "relative_value calculation produced NaN: {} * {} / {}", reach, payoff, sampling);
-        debug_assert!(!result.is_infinite(), "relative_value calculation produced infinity");
+        // Prevent numeric overflow that can create ±Inf and later NaNs
+        let mut result = reach * payoff / sampling;
+        if !result.is_finite() {
+            // Clamp to REGRET_MAX with correct sign to keep training stable
+            result = result.signum() * crate::REGRET_MAX;
+        }
+
+        debug_assert!(!result.is_nan(), "relative_value produced NaN after clamp");
+        debug_assert!(!result.is_infinite(), "relative_value still infinite after clamp");
 
         result
     }
