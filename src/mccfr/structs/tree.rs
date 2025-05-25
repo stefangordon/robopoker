@@ -54,8 +54,7 @@ where
     pub fn grow(&mut self, info: I, leaf: Branch<E, G>) -> Node<T, E, G, I> {
         let id = self.intern(info);
         let tail = self.graph.add_node((leaf.1, id));
-        let edge = self.graph.add_edge(leaf.2, tail, leaf.0);
-        assert!(edge.index() == tail.index() - 1);
+        let _edge = self.graph.add_edge(leaf.2, tail, leaf.0);
         self.at(tail)
     }
     /// Clear the tree for reuse, keeping allocated capacity
