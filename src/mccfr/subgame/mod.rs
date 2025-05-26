@@ -24,7 +24,7 @@
 //! let solver = SubgameSolver::builder()
 //!     .with_game_state(game)
 //!     .with_warm_start(blueprint_strategy)
-//!     .with_iterations(500)
+//!     .with_iterations(1000)
 //!     .build();
 //! let strategy = solver.solve().await;
 //! ```
@@ -67,8 +67,8 @@ pub struct SubgameParams {
 impl Default for SubgameParams {
     fn default() -> Self {
         Self {
-            regret_min: -3.0e5,  // looser bounds than global -3e5
-            regret_max:  3.0e5,
+            regret_min: -1.0e7,  // looser bounds than global -3e5
+            regret_max:  1.0e7,
             sampling_eps: 1e-6,  // floor to stabilise importance weights
         }
     }

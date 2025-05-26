@@ -234,6 +234,14 @@ impl Game {
                     a
                 }
             },
+            Action::Draw(hand) if hand.size() == 0 => {
+                // Handle "DEAL" without explicit cards - deal the appropriate cards for this street
+                if self.must_deal() {
+                    Action::Draw(self.deck().deal(self.street()))
+                } else {
+                    a
+                }
+            },
             _ => a
         };
 

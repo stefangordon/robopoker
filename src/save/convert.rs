@@ -282,7 +282,7 @@ impl Converter {
         writer.write_i16::<BigEndian>(-1).expect("Failed to write PostgreSQL trailer");
     }
 
-    /// Convert mmap format to Parquet format
+    /// Convert mmap format to Parquet format using streaming chunks
     #[cfg(feature = "native")]
     fn convert_mmap_to_parquet(source_path: &str) {
         use std::io::BufWriter;
@@ -314,63 +314,7 @@ impl Converter {
         let current_dir = std::env::current_dir().unwrap_or_default();
         let pgcopy_dir = current_dir.join("pgcopy");
         std::fs::create_dir_all(&pgcopy_dir).expect("Failed to create pgcopy directory");
-        let output_path = pgcopy_dir.join("blueprint");
-
-        // Collect all records into vectors for columnar storage
-        let mut histories = Vec::with_capacity(total_records);
-        let mut presents = Vec::with_capacity(total_records);
-        let mut futures_vec = Vec::with_capacity(total_records);
-        let mut edges = Vec::with_capacity(total_records);
-        let mut regrets = Vec::with_capacity(total_records);
-        let mut policies = Vec::with_capacity(total_records);
-
-        let mut records_processed = 0;
-
-        // Process all records
-        for i in 0..total_records {
-            let offset = MMAP_HEADER_SIZE + (i * MMAP_RECORD_SIZE);
-
-            // Read record from mmap (little-endian format)
-            let history = LittleEndian::read_u64(&mmap[offset..offset+8]);
-            let present = LittleEndian::read_u64(&mmap[offset+8..offset+16]);
-            let futures = LittleEndian::read_u64(&mmap[offset+16..offset+24]);
-            let edge = LittleEndian::read_u64(&mmap[offset+24..offset+32]);
-            let regret = LittleEndian::read_f32(&mmap[offset+32..offset+36]);
-            let policy = LittleEndian::read_f32(&mmap[offset+36..offset+40]);
-
-            // Convert to appropriate types for Parquet
-            histories.push(history as i64);
-            presents.push(present as i64);
-            futures_vec.push(futures as i64);
-            edges.push(edge as u32);
-            regrets.push(regret);
-            policies.push(policy);
-
-            records_processed += 1;
-
-            // Log progress periodically
-            if records_processed % 1_000_000 == 0 || records_processed == total_records {
-                let percentage = (records_processed * 100) / total_records;
-                log::info!("Conversion progress: {}% ({} / {} records)", percentage, records_processed, total_records);
-            }
-        }
-
-        // Create arrow arrays
-        let hist_array = Int64Array::from_slice(&histories);
-        let pres_array = Int64Array::from_slice(&presents);
-        let fut_array = Int64Array::from_slice(&futures_vec);
-        let edge_array = UInt32Array::from_slice(&edges);
-        let regret_array = Float32Array::from_slice(&regrets);
-        let policy_array = Float32Array::from_slice(&policies);
-
-        let columns: Vec<Arc<dyn Array>> = vec![
-            Arc::new(hist_array),
-            Arc::new(pres_array),
-            Arc::new(fut_array),
-            Arc::new(edge_array),
-            Arc::new(regret_array),
-            Arc::new(policy_array),
-        ];
+        let output_path = pgcopy_dir.join("blueprint.parquet");
 
         // Create schema
         let schema = Schema::from(vec![
@@ -400,29 +344,90 @@ impl Converter {
             data_pagesize_limit: Some(512 * 1024), // 512KB pages
         };
 
-        // Create chunk
-        let chunk = Chunk::new(columns);
-
-        // Create row group iterator
-        let row_groups = RowGroupIterator::try_new(
-            vec![Ok(chunk)].into_iter(),
-            &schema,
-            options,
-            encodings,
-        ).expect("Failed to create row group iterator");
-
-        // Write to file
+        // Create output file and writer
         let file = File::create(&output_path)
             .expect(&format!("Failed to create file at {}", output_path.display()));
         let writer_inner = BufWriter::new(file);
-        let mut writer = FileWriter::try_new(writer_inner, schema, options)
+        let mut writer = FileWriter::try_new(writer_inner, schema.clone(), options)
             .expect("Failed to create parquet writer");
 
-        for group in row_groups {
-            writer.write(group.expect("Failed to get row group"))
-                .expect("Failed to write row group");
+        // Process records in chunks to avoid loading everything into memory
+        const RECORDS_PER_CHUNK: usize = 100_000; // Process 100k records at a time
+        let mut records_processed = 0;
+
+        for chunk_start in (0..total_records).step_by(RECORDS_PER_CHUNK) {
+            let chunk_end = (chunk_start + RECORDS_PER_CHUNK).min(total_records);
+            let chunk_size = chunk_end - chunk_start;
+
+            // Allocate vectors for this chunk only
+            let mut histories = Vec::with_capacity(chunk_size);
+            let mut presents = Vec::with_capacity(chunk_size);
+            let mut futures_vec = Vec::with_capacity(chunk_size);
+            let mut edges = Vec::with_capacity(chunk_size);
+            let mut regrets = Vec::with_capacity(chunk_size);
+            let mut policies = Vec::with_capacity(chunk_size);
+
+            // Read chunk of records from mmap
+            for i in chunk_start..chunk_end {
+                let offset = MMAP_HEADER_SIZE + (i * MMAP_RECORD_SIZE);
+
+                // Read record from mmap (little-endian format)
+                let history = LittleEndian::read_u64(&mmap[offset..offset+8]);
+                let present = LittleEndian::read_u64(&mmap[offset+8..offset+16]);
+                let futures = LittleEndian::read_u64(&mmap[offset+16..offset+24]);
+                let edge = LittleEndian::read_u64(&mmap[offset+24..offset+32]);
+                let regret = LittleEndian::read_f32(&mmap[offset+32..offset+36]);
+                let policy = LittleEndian::read_f32(&mmap[offset+36..offset+40]);
+
+                // Convert to appropriate types for Parquet
+                histories.push(history as i64);
+                presents.push(present as i64);
+                futures_vec.push(futures as i64);
+                edges.push(edge as u32);
+                regrets.push(regret);
+                policies.push(policy);
+
+                records_processed += 1;
+            }
+
+            // Create arrow arrays for this chunk
+            let hist_array = Int64Array::from_slice(&histories);
+            let pres_array = Int64Array::from_slice(&presents);
+            let fut_array = Int64Array::from_slice(&futures_vec);
+            let edge_array = UInt32Array::from_slice(&edges);
+            let regret_array = Float32Array::from_slice(&regrets);
+            let policy_array = Float32Array::from_slice(&policies);
+
+            let columns: Vec<Arc<dyn Array>> = vec![
+                Arc::new(hist_array),
+                Arc::new(pres_array),
+                Arc::new(fut_array),
+                Arc::new(edge_array),
+                Arc::new(regret_array),
+                Arc::new(policy_array),
+            ];
+
+            // Create chunk and write as row group
+            let chunk = Chunk::new(columns);
+            let row_groups = RowGroupIterator::try_new(
+                vec![Ok(chunk)].into_iter(),
+                &schema,
+                options,
+                encodings.clone(),
+            ).expect("Failed to create row group iterator");
+
+            // Write this chunk as a row group
+            for group in row_groups {
+                writer.write(group.expect("Failed to get row group"))
+                    .expect("Failed to write row group");
+            }
+
+            // Log progress
+            let percentage = (records_processed * 100) / total_records;
+            log::info!("Conversion progress: {}% ({} / {} records)", percentage, records_processed, total_records);
         }
 
+        // Finalize the parquet file
         let _size = writer.end(None).expect("Failed to finalize parquet file");
         log::info!("Successfully converted {} records to {}", records_processed, output_path.display());
     }

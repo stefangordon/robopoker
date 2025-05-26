@@ -822,7 +822,16 @@ impl API {
         if self.should_solve_subgame(street, pot, Self::stack_to_pot_ratio(&game, recall.hero_position())) {
             // Attempt to get blueprint policy for warm-starting.
             let warm_start_strategy = self.blueprint_policy(&recall, true).await.unwrap_or(None);
-            return self.solve_subgame_unsafe(&recall, warm_start_strategy).await;
+            
+            // If blueprint lookup fails, try a fallback strategy for warm start
+            let effective_warm_start = if warm_start_strategy.is_none() {
+                log::debug!("Blueprint miss for warm start, trying fallback strategy");
+                self.fallback_warm_start_strategy(&game).await
+            } else {
+                warm_start_strategy
+            };
+            
+            return self.solve_subgame_unsafe(&recall, effective_warm_start).await;
         }
 
         // Otherwise use existing blueprint lookup
@@ -853,6 +862,56 @@ impl API {
         let estimated_remaining = (starting_stack - pot / 2.0).max(0.0);
 
         estimated_remaining / pot
+    }
+
+    /// Generate a fallback warm start strategy when blueprint lookup fails
+    async fn fallback_warm_start_strategy(&self, game: &Game) -> Option<Vec<Decision>> {
+        use crate::gameplay::edge::Edge;
+        
+        // Create a reasonable default strategy based on game state
+        let legal_actions = game.legal();
+        if legal_actions.is_empty() {
+            return None;
+        }
+
+        // Convert actions to edges and create a balanced strategy
+        let edges: Vec<Edge> = legal_actions.iter().map(|action| game.edgify(*action)).collect();
+        let n = edges.len() as f32;
+        
+        // Create a slightly more realistic strategy than uniform:
+        // - Favor checking/calling over folding
+        // - Moderate aggression
+        let strategy: Vec<Decision> = edges.into_iter().map(|edge| {
+            let weight = match edge {
+                Edge::Fold => 0.1,      // Low fold frequency
+                Edge::Check => 0.4,     // Prefer checking when possible
+                Edge::Call => 0.3,      // Moderate calling
+                Edge::Raise(_) => 0.15,  // Some aggression
+                Edge::Shove => 0.05,    // Conservative with all-ins
+                Edge::Draw => 1.0,      // Always deal when required
+            };
+            Decision::from((edge, weight))
+        }).collect();
+
+        // Normalize weights
+        let total_weight: f32 = strategy.iter().map(|d| d.weight()).sum();
+        if total_weight > 0.0 {
+            let normalized_strategy: Vec<Decision> = strategy.into_iter().map(|d| {
+                Decision::from((d.edge(), d.weight() / total_weight))
+            }).collect();
+            
+            log::debug!("Generated fallback warm start with {} actions", normalized_strategy.len());
+            Some(normalized_strategy)
+        } else {
+            // Last resort: uniform strategy
+            let uniform_weight = 1.0 / n;
+            let uniform_strategy: Vec<Decision> = legal_actions.iter().map(|action| {
+                Decision::from((game.edgify(*action), uniform_weight))
+            }).collect();
+            
+            log::debug!("Generated uniform fallback warm start with {} actions", uniform_strategy.len());
+            Some(uniform_strategy)
+        }
     }
 
     /// Solve a subgame with enhanced action abstraction
@@ -934,7 +993,7 @@ impl API {
                 return Ok(None); // For warm-start, a miss means no strategy to provide
             } else {
                 // For a hard miss, solve subgame without warm-start info
-                return Ok(Some(self.solve_subgame_unsafe(&recall, None).await?));
+                return Ok(None); //return Ok(Some(self.solve_subgame_unsafe(&recall, None).await?));
             }
         }
 

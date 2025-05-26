@@ -43,6 +43,133 @@ impl SubgameProfile {
     /// Set the root info for strategy extraction
     pub fn set_root_info(&mut self, info: Info) {
         self.root_info = Some(info);
+
+        // Initialize regrets and policies from warm start if available
+        if !self.warm_start.is_empty() {
+            self.initialize_from_warm_start(&info);
+        }
+    }
+
+        /// Initialize regrets and policies from warm start strategy
+    fn initialize_from_warm_start(&mut self, info: &Info) {
+        let canonical_info = Self::canonical(info);
+        
+        // Debug: log the warm start strategy
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("Warm start strategy contains {} actions:", self.warm_start.len());
+            for (i, decision) in self.warm_start.iter().enumerate() {
+                log::debug!("  {}: edge={:?} weight={:.6}", i, decision.edge(), decision.weight());
+            }
+        }
+        
+        // Get the subgame's available edges
+        let subgame_edges = info.choices();
+        
+        // Debug: log the subgame edges
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("Subgame has {} available edges:", subgame_edges.len());
+            for (i, edge) in subgame_edges.iter().enumerate() {
+                log::debug!("  {}: {:?}", i, edge);
+            }
+        }
+        
+        // Translate warm start strategy to subgame action space
+        let translated_strategy = self.translate_warm_start_to_subgame(subgame_edges);
+        
+        if !translated_strategy.is_empty() {
+            let total_weight: f32 = translated_strategy.iter().map(|(_, w)| *w).sum();
+            let translated_count = translated_strategy.len();
+
+            if total_weight > 0.0 {
+                for (edge, weight) in translated_strategy {
+                    let normalized_weight = weight / total_weight;
+
+                    // Initialize with positive policy weight to seed the strategy
+                    self.policies.insert((canonical_info, edge), normalized_weight * 10.0);
+
+                    // Initialize regrets to zero (neutral starting point)
+                    self.regrets.insert((canonical_info, edge), 0.0);
+                }
+
+                log::debug!("Translated and initialized subgame profile from warm start: {} -> {} actions",
+                           self.warm_start.len(), translated_count);
+            }
+        } else {
+            log::debug!("Could not translate warm start strategy to subgame action space");
+        }
+    }
+
+        /// Translate warm start strategy from blueprint action space to subgame action space
+    fn translate_warm_start_to_subgame(&self, subgame_edges: Vec<Edge>) -> Vec<(Edge, f32)> {
+        let mut translated = Vec::new();
+
+        // Group warm start decisions by action type
+        let mut check_weight = 0.0;
+        let mut fold_weight = 0.0;
+        let mut call_weight = 0.0;
+        let mut raise_weight = 0.0;
+        let mut shove_weight = 0.0;
+        let mut draw_weight = 0.0;
+
+        for decision in &self.warm_start {
+            match decision.edge() {
+                Edge::Check => check_weight += decision.weight(),
+                Edge::Fold => fold_weight += decision.weight(),
+                Edge::Call => call_weight += decision.weight(),
+                Edge::Raise(_) => raise_weight += decision.weight(), // Aggregate all raises
+                Edge::Shove => shove_weight += decision.weight(),
+                Edge::Draw => draw_weight += decision.weight(),
+            }
+        }
+
+        // Count total raise edges first (before consuming the vector)
+        let raise_edge_count = subgame_edges.iter()
+            .filter(|e| matches!(e, Edge::Raise(_)))
+            .count() as f32;
+
+        // Map to subgame edges
+        for edge in subgame_edges {
+            let weight = match edge {
+                Edge::Check => check_weight,
+                Edge::Fold => fold_weight,
+                Edge::Call => call_weight,
+                Edge::Shove => shove_weight,
+                Edge::Draw => draw_weight,
+                                Edge::Raise(odds) => {
+                    // Distribute raise weight across all subgame raise sizes
+                    // Give more weight to middle-sized bets (around 0.75x to 1.5x pot)
+                    let pot_ratio = odds.0 as f32 / odds.1 as f32;
+                    let preference = if pot_ratio >= 0.5 && pot_ratio <= 2.0 {
+                        1.5 // Prefer reasonable bet sizes
+                    } else if pot_ratio >= 0.25 && pot_ratio <= 4.0 {
+                        1.0 // Normal weight for extreme sizes
+                    } else {
+                        0.5 // Lower weight for very extreme sizes
+                    };
+                    
+                    if raise_edge_count > 0.0 {
+                        if raise_weight > 0.0 {
+                            // Distribute actual raise weight from blueprint
+                            (raise_weight * preference) / raise_edge_count
+                        } else {
+                            // Blueprint has no raises, but give subgame raises small weight
+                            // Use a fraction of the total non-raise weight
+                            let total_non_raise_weight = check_weight + fold_weight + call_weight + shove_weight + draw_weight;
+                            let fallback_raise_weight = total_non_raise_weight * 0.1; // 10% of other actions
+                            (fallback_raise_weight * preference) / raise_edge_count
+                        }
+                    } else {
+                        0.0
+                    }
+                }
+            };
+
+            if weight > 0.0 {
+                translated.push((edge, weight));
+            }
+        }
+
+        translated
     }
 
     /// Canonicalize an Info by stripping its history so that
@@ -72,7 +199,7 @@ impl SubgameProfile {
                         (edge.clone(), regret)
                     })
                     .collect();
-                
+
                 // Compute positive portion sum for regret matching
                 let pos_sum: f32 = edges
                     .iter()
@@ -126,22 +253,32 @@ impl SubgameProfile {
                                 .into_iter()
                                 .map(|(edge, w)| Decision::from((edge, w / sum_policy)))
                                 .collect()
+                        } else if !self.warm_start.is_empty() {
+                            // Use warm start strategy if available
+                            log::debug!("Using warm-start strategy (no accumulated data)");
+                            self.warm_start.clone()
                         } else {
                             // Last resort uniform
                             let n = info.choices().len() as f32;
-                            info.choices()
+                            let strategy = info.choices()
                                 .into_iter()
                                 .map(|edge| Decision::from((edge, 1.0 / n)))
-                                .collect()
+                                .collect();
+                            log::debug!("Using uniform fallback strategy (no warm start available)");
+                            strategy
                         };
-                        log::debug!("Using average-policy fallback strategy (shift sum zero)");
                         strategy
                     }
                 }
             }
             None => {
-                log::debug!("Using warm-start strategy (no root info)");
-                self.warm_start.clone()
+                if !self.warm_start.is_empty() {
+                    log::debug!("Using warm-start strategy (no root info)");
+                    self.warm_start.clone()
+                } else {
+                    log::debug!("No warm start or root info available, returning empty strategy");
+                    vec![]
+                }
             }
         }
     }

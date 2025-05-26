@@ -75,7 +75,7 @@ impl From<tokio_postgres::Row> for Sample {
 impl From<tokio_postgres::Row> for Decision {
     fn from(row: tokio_postgres::Row) -> Self {
         Self {
-            edge: Edge::from(row.get::<_, i64>("edge") as u64).to_string(),
+            edge: Edge::from(row.get::<_, i64>("edge") as u8).to_string(),
             prob: Probability::from(row.get::<_, f32>("policy")),
         }
     }
