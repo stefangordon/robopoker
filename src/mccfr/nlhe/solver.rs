@@ -3,6 +3,7 @@ use super::profile::Profile;
 use crate::cards::street::Street;
 use crate::save::disk::Disk;
 use crate::Arbitrary;
+use crate::mccfr::nlhe::encoder::BlueprintEncoder;
 
 /// NLHE represents the complete Monte Carlo Counterfactual Regret Minimization (MCCFR) algorithm
 /// for No-Limit Hold'em poker. It combines:
@@ -28,7 +29,7 @@ impl Disk for NLHE {
         unimplemented!()
     }
     fn done(street: Street) -> bool {
-        Profile::done(street) && Encoder::done(street)
+        Profile::done(street) && BlueprintEncoder::done(street)
     }
     fn save(&self) {
         self.profile.save();

@@ -28,6 +28,21 @@ impl Odds {
         }
         (a, b)
     }
+    /// Pick the odds from `candidates` whose pot-ratio is closest to `amount / pot`.
+    /// Assumes `candidates` is non-empty and pre-sorted by ratio.
+    pub fn nearest_in(candidates: &[Self], amount: Chips, pot: Chips) -> Self {
+        use crate::Probability;
+        let target = amount as Utility / pot as Utility;
+        candidates
+            .iter()
+            .min_by(|x, y| {
+                let dx = (Probability::from(**x) as Utility - target).abs();
+                let dy = (Probability::from(**y) as Utility - target).abs();
+                dx.partial_cmp(&dy).unwrap()
+            })
+            .copied()
+            .unwrap_or(Self::from((amount, pot)))
+    }
     pub fn nearest((a, b): (Chips, Chips)) -> Self {
         let odds = a as Utility / b as Utility;
         Odds::GRID[Odds::GRID

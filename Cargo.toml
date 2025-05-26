@@ -45,6 +45,7 @@ smallvec = "1.11"
 ahash = "0.8"
 half = "2.4"
 memmap2 = { version = "0.9", optional = true }
+arrow2 = { version = "0.18", features = ["io_parquet", "io_parquet_compression"] }
 
 [lib]
 name = "robopokerlib"

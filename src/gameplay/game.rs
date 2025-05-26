@@ -534,6 +534,15 @@ impl Game {
             .max()
             .expect("non-empty seats")
     }
+
+    /// Total chips the given player has already committed to the pot (across all streets).
+    /// This is a lightweight accessor used mainly by evaluation code; it never mutates state.
+    pub fn spent(&self, position: usize) -> Chips {
+        self.seats
+            .get(position)
+            .map(|seat| seat.spent())
+            .expect("player index in bounds")
+    }
 }
 
 /// define blinds
@@ -666,7 +675,7 @@ impl Game {
 
     /// Finds the nearest allowed action to the provided action
     /// Returns None if there is no similar action allowed
-    fn find_nearest_action(&self, action: &Action) -> Option<Action> {
+    pub fn find_nearest_action(&self, action: &Action) -> Option<Action> {
         match action {
             Action::Raise(chips) => {
                 // Shortcut: if raising is currently disallowed (the minimum
@@ -726,6 +735,29 @@ impl Game {
             self.seats[position].reset_cards(hole);
         }
         self
+    }
+
+    /// Hole cards of the requested player, as dealt at the beginning of the hand.
+    /// The index is modulo `N` and the returned value is *private* to that seat.
+    pub fn hole_cards(&self, position: usize) -> Hole {
+        self.seats
+            .get(position % self.n())
+            .map(|seat| seat.cards())
+            .expect("player index in bounds")
+    }
+}
+
+impl Game {
+    /// Build an Observation from the hero's pocket cards (given by `hero_idx`)
+    /// and the public board, independent of whose turn it is.  This is needed
+    /// for blueprint look-ups where the card information (present) must not be
+    /// affected by betting order.
+    pub fn sweat_for(&self, hero_idx: usize) -> Observation {
+        use crate::cards::hand::Hand;
+        Observation::from((
+            Hand::from(self.seats[hero_idx % self.n()].cards()),
+            Hand::from(self.board()),
+        ))
     }
 }
 

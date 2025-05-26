@@ -1,20 +1,27 @@
-use crate::mccfr::nlhe::profile::Profile;
-use crate::cards::street::Street;
-use crate::save::disk::Disk;
-use crate::Arbitrary;
+
 
 #[cfg(feature = "native")]
 use std::fs::File;
 #[cfg(feature = "native")]
-use std::io::{Read, Write};
-#[cfg(feature = "native")]
-use std::path::Path;
+use std::io::{Read, Write, Seek};
 #[cfg(feature = "native")]
 use memmap2::MmapOptions;
 #[cfg(feature = "native")]
 use byteorder::{ByteOrder, LittleEndian, BigEndian, WriteBytesExt};
 #[cfg(feature = "native")]
 use zstd::stream::Encoder as ZEncoder;
+#[cfg(feature = "native")]
+use arrow2::{
+    array::{Int64Array, UInt32Array, Float32Array, Array},
+    chunk::Chunk,
+    datatypes::{DataType, Field, Schema},
+    io::parquet::write::{
+        CompressionOptions, Encoding, FileWriter, RowGroupIterator,
+        Version, WriteOptions
+    },
+};
+#[cfg(feature = "native")]
+use std::sync::Arc;
 
 // File format constants (from profile.rs)
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -43,29 +50,31 @@ impl Converter {
     ///
     /// # Example
     /// ```bash
-    /// cargo run --release -- --generatepgdata
+    /// cargo run --release -- --convert-blueprint-to-postgres
     /// ```
     #[cfg(feature = "native")]
-    pub fn generate_pg_data() {
+    pub fn convert_blueprint_to_postgres() {
         log::info!("Starting blueprint to PostgreSQL format conversion");
 
-        // Check if the blueprint file exists
-        let blueprint_path = Profile::path(Street::random());
-        if !std::path::Path::new(&blueprint_path).exists() {
-            log::error!("Blueprint file not found at: {}", blueprint_path);
+        // Look for the old blueprint file without extension
+        let current_dir = std::env::current_dir().unwrap_or_default();
+        let old_blueprint_path = current_dir.join("pgcopy").join("blueprint");
+
+        if !old_blueprint_path.exists() {
+            log::error!("Blueprint file not found at: {}", old_blueprint_path.display());
             log::error!("Please ensure a blueprint file exists before running conversion");
             return;
         }
 
-        log::info!("Reading blueprint file from: {}", blueprint_path);
+        log::info!("Reading blueprint file from: {}", old_blueprint_path.display());
 
         // Detect the format by checking magic bytes
-        Self::convert_blueprint(&blueprint_path);
+        Self::convert_blueprint(&old_blueprint_path.to_string_lossy());
 
-                log::info!("Blueprint conversion completed");
+        log::info!("Blueprint conversion completed");
     }
 
-        /// Convert blueprint file, handling both legacy and new formats
+    /// Convert blueprint file, handling both legacy and new formats
     #[cfg(feature = "native")]
     fn convert_blueprint(source_path: &str) {
         let format = Self::detect_format(source_path);
@@ -77,6 +86,29 @@ impl Converter {
             FormatType::NewMmap => {
                 log::info!("Converting from new mmap format to PostgreSQL format");
                 Self::convert_mmap_to_postgres(source_path);
+            }
+            FormatType::Parquet => {
+                log::info!("Source file is already in Parquet format - no conversion needed");
+            }
+        }
+    }
+
+    /// Convert blueprint file to Parquet format
+    #[cfg(feature = "native")]
+    pub fn convert_to_parquet(source_path: &str) {
+        let format = Self::detect_format(source_path);
+
+        match format {
+            FormatType::LegacyZstdPostgres => {
+                log::error!("Converting from PostgreSQL format to Parquet is not yet implemented");
+                // TODO: Implement if needed
+            }
+            FormatType::NewMmap => {
+                log::info!("Converting from mmap format to Parquet format");
+                Self::convert_mmap_to_parquet(source_path);
+            }
+            FormatType::Parquet => {
+                log::info!("Source file is already in Parquet format - no conversion needed");
             }
         }
     }
@@ -92,7 +124,23 @@ impl Converter {
 
         if magic == ZSTD_MAGIC {
             FormatType::LegacyZstdPostgres
+        } else if magic == [b'P', b'A', b'R', b'1'] {
+            // Parquet magic bytes at the beginning
+            FormatType::Parquet
         } else {
+            // Check for Parquet magic bytes at the end (more common)
+            use std::io::SeekFrom;
+            if let Ok(metadata) = file.metadata() {
+                let file_size = metadata.len();
+                if file_size >= 4 {
+                    let mut end_magic = [0u8; 4];
+                    if file.seek(SeekFrom::End(-4)).is_ok() &&
+                       file.read_exact(&mut end_magic).is_ok() &&
+                       end_magic == [b'P', b'A', b'R', b'1'] {
+                        return FormatType::Parquet;
+                    }
+                }
+            }
             FormatType::NewMmap
         }
     }
@@ -123,11 +171,11 @@ impl Converter {
 
         log::info!("Converting {} records from mmap to PostgreSQL format", total_records);
 
-        // Determine output path (same directory as source)
-        let source_dir = Path::new(source_path)
-            .parent()
-            .expect("Failed to determine source directory");
-        let output_path = source_dir.join("blueprint.pg");
+        // Determine output path - use pgcopy directory for PostgreSQL format
+        let current_dir = std::env::current_dir().unwrap_or_default();
+        let pgcopy_dir = current_dir.join("pgcopy");
+        std::fs::create_dir_all(&pgcopy_dir).expect("Failed to create pgcopy directory");
+        let output_path = pgcopy_dir.join("blueprint.pg");
 
         // Create output file with zstd compression
         let output_file = File::create(&output_path)
@@ -234,10 +282,192 @@ impl Converter {
         writer.write_i16::<BigEndian>(-1).expect("Failed to write PostgreSQL trailer");
     }
 
+    /// Convert mmap format to Parquet format
+    #[cfg(feature = "native")]
+    fn convert_mmap_to_parquet(source_path: &str) {
+        use std::io::BufWriter;
+
+        log::info!("Converting mmap format to Parquet format");
+
+        // Memory-map the source file
+        let source_file = File::open(source_path)
+            .expect("Failed to open source file");
+
+        let mmap = unsafe { MmapOptions::new().map(&source_file) }
+            .expect("Failed to memory map source file");
+
+        // Validate file size and read header
+        if mmap.len() < MMAP_HEADER_SIZE {
+            panic!("Source file too small to contain header: {} bytes", mmap.len());
+        }
+
+        let total_records = LittleEndian::read_u64(&mmap[0..MMAP_HEADER_SIZE]) as usize;
+        let expected_size = MMAP_HEADER_SIZE + (total_records * MMAP_RECORD_SIZE);
+
+        if mmap.len() < expected_size {
+            panic!("Source file size mismatch: expected {} bytes, got {}", expected_size, mmap.len());
+        }
+
+        log::info!("Converting {} records from mmap to Parquet format", total_records);
+
+        // Determine output path - use pgcopy directory
+        let current_dir = std::env::current_dir().unwrap_or_default();
+        let pgcopy_dir = current_dir.join("pgcopy");
+        std::fs::create_dir_all(&pgcopy_dir).expect("Failed to create pgcopy directory");
+        let output_path = pgcopy_dir.join("blueprint");
+
+        // Collect all records into vectors for columnar storage
+        let mut histories = Vec::with_capacity(total_records);
+        let mut presents = Vec::with_capacity(total_records);
+        let mut futures_vec = Vec::with_capacity(total_records);
+        let mut edges = Vec::with_capacity(total_records);
+        let mut regrets = Vec::with_capacity(total_records);
+        let mut policies = Vec::with_capacity(total_records);
+
+        let mut records_processed = 0;
+
+        // Process all records
+        for i in 0..total_records {
+            let offset = MMAP_HEADER_SIZE + (i * MMAP_RECORD_SIZE);
+
+            // Read record from mmap (little-endian format)
+            let history = LittleEndian::read_u64(&mmap[offset..offset+8]);
+            let present = LittleEndian::read_u64(&mmap[offset+8..offset+16]);
+            let futures = LittleEndian::read_u64(&mmap[offset+16..offset+24]);
+            let edge = LittleEndian::read_u64(&mmap[offset+24..offset+32]);
+            let regret = LittleEndian::read_f32(&mmap[offset+32..offset+36]);
+            let policy = LittleEndian::read_f32(&mmap[offset+36..offset+40]);
+
+            // Convert to appropriate types for Parquet
+            histories.push(history as i64);
+            presents.push(present as i64);
+            futures_vec.push(futures as i64);
+            edges.push(edge as u32);
+            regrets.push(regret);
+            policies.push(policy);
+
+            records_processed += 1;
+
+            // Log progress periodically
+            if records_processed % 1_000_000 == 0 || records_processed == total_records {
+                let percentage = (records_processed * 100) / total_records;
+                log::info!("Conversion progress: {}% ({} / {} records)", percentage, records_processed, total_records);
+            }
+        }
+
+        // Create arrow arrays
+        let hist_array = Int64Array::from_slice(&histories);
+        let pres_array = Int64Array::from_slice(&presents);
+        let fut_array = Int64Array::from_slice(&futures_vec);
+        let edge_array = UInt32Array::from_slice(&edges);
+        let regret_array = Float32Array::from_slice(&regrets);
+        let policy_array = Float32Array::from_slice(&policies);
+
+        let columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(hist_array),
+            Arc::new(pres_array),
+            Arc::new(fut_array),
+            Arc::new(edge_array),
+            Arc::new(regret_array),
+            Arc::new(policy_array),
+        ];
+
+        // Create schema
+        let schema = Schema::from(vec![
+            Field::new("history", DataType::Int64, false),
+            Field::new("present", DataType::Int64, false),
+            Field::new("futures", DataType::Int64, false),
+            Field::new("edge", DataType::UInt32, false),
+            Field::new("regret", DataType::Float32, false),
+            Field::new("policy", DataType::Float32, false),
+        ]);
+
+        // Define encodings
+        let encodings = vec![
+            vec![Encoding::Plain],      // history
+            vec![Encoding::Plain],      // present
+            vec![Encoding::Plain],      // futures
+            vec![Encoding::Plain],      // edge
+            vec![Encoding::Plain],      // regret
+            vec![Encoding::Plain],      // policy
+        ];
+
+        // Write options
+        let options = WriteOptions {
+            write_statistics: true,
+            compression: CompressionOptions::Zstd(None),
+            version: Version::V2,
+            data_pagesize_limit: Some(512 * 1024), // 512KB pages
+        };
+
+        // Create chunk
+        let chunk = Chunk::new(columns);
+
+        // Create row group iterator
+        let row_groups = RowGroupIterator::try_new(
+            vec![Ok(chunk)].into_iter(),
+            &schema,
+            options,
+            encodings,
+        ).expect("Failed to create row group iterator");
+
+        // Write to file
+        let file = File::create(&output_path)
+            .expect(&format!("Failed to create file at {}", output_path.display()));
+        let writer_inner = BufWriter::new(file);
+        let mut writer = FileWriter::try_new(writer_inner, schema, options)
+            .expect("Failed to create parquet writer");
+
+        for group in row_groups {
+            writer.write(group.expect("Failed to get row group"))
+                .expect("Failed to write row group");
+        }
+
+        let _size = writer.end(None).expect("Failed to finalize parquet file");
+        log::info!("Successfully converted {} records to {}", records_processed, output_path.display());
+    }
+
+    /// Convert blueprint file to Parquet format
+    ///
+    /// This method converts old mmap format files to the new Parquet format.
+    /// If the file is already in Parquet format, no conversion is performed.
+    ///
+    /// # Example
+    /// ```bash
+    /// cargo run --release -- --convert-to-parquet
+    /// ```
+    #[cfg(feature = "native")]
+    pub fn convert_blueprint_to_parquet() {
+        log::info!("Starting blueprint to Parquet format conversion");
+
+        // Look for the old blueprint file without extension
+        let current_dir = std::env::current_dir().unwrap_or_default();
+        let old_blueprint_path = current_dir.join("pgcopy").join("blueprint");
+
+        if !old_blueprint_path.exists() {
+            log::error!("Blueprint file not found at: {}", old_blueprint_path.display());
+            log::error!("Please ensure a blueprint file exists before running conversion");
+            return;
+        }
+
+        log::info!("Reading blueprint file from: {}", old_blueprint_path.display());
+
+        // Convert the file
+        Self::convert_to_parquet(&old_blueprint_path.to_string_lossy());
+
+        log::info!("Blueprint conversion completed");
+    }
+
     /// Stub implementation for non-native feature
     #[cfg(not(feature = "native"))]
-    pub fn generate_pg_data() {
-        log::error!("PostgreSQL data generation requires the 'native' feature");
+    pub fn convert_blueprint_to_postgres() {
+        log::error!("PostgreSQL conversion requires the 'native' feature");
+    }
+
+    /// Stub implementation for non-native feature
+    #[cfg(not(feature = "native"))]
+    pub fn convert_blueprint_to_parquet() {
+        log::error!("Parquet conversion requires the 'native' feature");
     }
 }
 
@@ -246,4 +476,5 @@ impl Converter {
 enum FormatType {
     LegacyZstdPostgres,
     NewMmap,
+    Parquet,
 }

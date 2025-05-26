@@ -11,34 +11,23 @@ use crate::gameplay::odds::Odds;
 use crate::gameplay::path::Path;
 use crate::mccfr::types::branch::Branch;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 
 type Tree = crate::mccfr::structs::tree::Tree<Turn, Edge, Game, Info>;
 
-#[derive(Default)]
-pub struct Encoder {
-    lookup: BTreeMap<Isomorphism, Abstraction>,
+/// Strategy object that determines which bet sizes are allowed at a given
+/// game state and depth.  This lets us reuse the full NLHE encoder for both
+/// blueprint training (coarse grid) and sub-game re-solving (rich grid)
+/// simply by swapping the type parameter.
+pub trait BetSizer {
+    fn raises(game: &Game, depth: usize) -> Vec<Odds>;
 }
 
-impl Encoder {
-    fn name() -> String {
-        "isomorphism".to_string()
-    }
-
-    pub fn abstraction(&self, iso: &Isomorphism) -> Abstraction {
-        self.lookup
-            .get(iso)
-            .copied()
-            .expect("isomorphsim not found in abstraction loookup")
-    }
-
-    pub fn choices(game: &Game, depth: usize) -> Vec<Edge> {
-        game.legal()
-            .into_iter()
-            .flat_map(|action| Self::unfold(game, depth, action))
-            .collect()
-    }
-
-    pub fn raises(game: &Game, depth: usize) -> Vec<Odds> {
+/// Original blueprint sizing behaviour – identical code that used to live
+/// inside `Encoder::raises`.
+pub struct BlueprintSizer;
+impl BetSizer for BlueprintSizer {
+    fn raises(game: &Game, depth: usize) -> Vec<Odds> {
         if depth > crate::MAX_RAISE_REPEATS {
             vec![]
         } else {
@@ -51,6 +40,51 @@ impl Encoder {
                 },
             }
         }
+    }
+}
+
+pub type BlueprintEncoder = Encoder<BlueprintSizer>;
+
+#[derive(Default)]
+pub struct Encoder<S: BetSizer = BlueprintSizer> {
+    lookup: BTreeMap<Isomorphism, Abstraction>,
+    _phantom: PhantomData<S>,
+}
+
+impl<S: BetSizer> Encoder<S> {
+    fn name() -> String {
+        "isomorphism".to_string()
+    }
+
+    pub fn abstraction(&self, iso: &Isomorphism) -> Abstraction {
+        self.lookup
+            .get(iso)
+            .copied()
+            .expect(&format!("Missing abstraction for isomorphism {:?}. All abstractions should be preloaded.", iso))
+    }
+
+    /// Get a clone of the abstraction lookup
+    pub fn get_lookup(&self) -> BTreeMap<Isomorphism, Abstraction> {
+        self.lookup.clone()
+    }
+
+    /// Construct an Encoder with a pre-loaded abstraction lookup (used by subgame re-solver)
+    pub fn new(lookup: BTreeMap<Isomorphism, Abstraction>) -> Self {
+        Self {
+            lookup,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn choices(game: &Game, depth: usize) -> Vec<Edge> {
+        game.legal()
+            .into_iter()
+            .flat_map(|action| Self::unfold(game, depth, action))
+            .collect()
+    }
+
+    pub fn raises(game: &Game, depth: usize) -> Vec<Odds> {
+        S::raises(game, depth)
     }
 
     pub fn unfold(game: &Game, depth: usize, action: Action) -> Vec<Edge> {
@@ -75,7 +109,7 @@ impl Encoder {
     }
 }
 
-impl crate::mccfr::traits::encoder::Encoder for Encoder {
+impl<S: BetSizer> crate::mccfr::traits::encoder::Encoder for Encoder<S> {
     type T = Turn;
     type E = Edge;
     type G = Game;
@@ -109,7 +143,7 @@ impl crate::mccfr::traits::encoder::Encoder for Encoder {
 }
 
 #[cfg(feature = "native")]
-impl crate::save::upload::Table for Encoder {
+impl<S: BetSizer> crate::save::upload::Table for Encoder<S> {
     fn name() -> String {
         Self::name()
     }
@@ -169,7 +203,7 @@ impl crate::save::upload::Table for Encoder {
     }
 }
 
-impl crate::save::disk::Disk for Encoder {
+impl<S: BetSizer> crate::save::disk::Disk for Encoder<S> {
     fn name() -> String {
         Self::name()
     }
@@ -190,6 +224,7 @@ impl crate::save::disk::Disk for Encoder {
                     map.extend(l);
                     map
                 }),
+            _phantom: PhantomData,
         }
     }
 }

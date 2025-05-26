@@ -20,7 +20,7 @@ use arrow2::{
     chunk::Chunk,
     datatypes::{DataType, Field, Schema},
     io::parquet::{
-        read::{FileReader, RowGroupReader},
+        read::{read_metadata, infer_schema, FileReader},
         write::{
             CompressionOptions, Encoding, FileWriter, RowGroupIterator,
             Version, WriteOptions
@@ -47,7 +47,6 @@ use std::sync::Arc;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const PGCOPY_RECORD_SIZE: usize = 66; // 2-byte header already consumed + 64 payload
 const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
-const CHUNK_SIZE: usize = 1000; // Processing chunk size for better cache performance
 
 // Using SmallVec (inline capacity 4) instead of a per-infoset HashMap dramatically
 // reduces overhead. The majority of infosets have ≤4 edges.
@@ -325,8 +324,8 @@ impl crate::save::disk::Disk for Profile {
     fn path(_: Street) -> String {
         let current_dir = std::env::current_dir().unwrap_or_default();
         let path = PathBuf::from(current_dir)
-            .join("data")
-            .join(format!("{}.parquet", Self::name()));
+            .join("pgcopy")
+            .join(Self::name());
 
         path.to_string_lossy().into_owned()
     }
@@ -476,7 +475,7 @@ impl Profile {
             vec![Encoding::Plain],      // history
             vec![Encoding::Plain],      // present
             vec![Encoding::Plain],      // futures
-            vec![Encoding::RleDictionary], // edge (low cardinality)
+            vec![Encoding::Plain],      // edge
             vec![Encoding::Plain],      // regret
             vec![Encoding::Plain],      // policy
         ];
@@ -522,7 +521,6 @@ impl Profile {
         use crate::gameplay::path::Path;
         use crate::save::disk::Disk;
         use std::fs::File;
-        use arrow2::io::parquet::read;
 
         let path_str = Self::path(Street::random());
         log::info!("{:<32}{:<32}", "loading     blueprint", path_str);
@@ -530,10 +528,10 @@ impl Profile {
         let mut file = File::open(&path_str).expect(&format!("Failed to open blueprint file: {}", path_str));
         
         // Read metadata
-        let metadata = read::read_metadata(&mut file).expect("Failed to read parquet metadata");
+        let metadata = read_metadata(&mut file).expect("Failed to read parquet metadata");
         
         // Infer schema
-        let schema = read::infer_schema(&metadata).expect("Failed to infer schema");
+        let schema = infer_schema(&metadata).expect("Failed to infer schema");
         
         log::info!("Loading blueprint from {} row groups", metadata.row_groups.len());
 
@@ -545,7 +543,7 @@ impl Profile {
         // Process each row group
         for (rg_idx, row_group) in metadata.row_groups.iter().enumerate() {
             // Create a file reader for this row group
-            let chunks = read::FileReader::new(
+            let chunks = FileReader::new(
                 file.try_clone().expect("Failed to clone file handle"),
                 vec![row_group.clone()],
                 schema.clone(),

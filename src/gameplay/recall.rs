@@ -8,6 +8,10 @@ use crate::gameplay::path::Path;
 use crate::gameplay::turn::Turn;
 use crate::cards::hand::Hand;
 use crate::cards::deck::Deck;
+use crate::gameplay::odds::Odds;
+use crate::mccfr::nlhe::encoder::BlueprintEncoder;
+use crate::Chips;
+use crate::gameplay::edge::Edge;
 
 /// a complete representation of perfect recall game history
 /// from the perspective of the hero. intended use is for
@@ -74,11 +78,9 @@ impl Recall {
                 if call_amount == 0 {
                     // No chips required – treat as a check.
                     Action::Check
-                } else if call_amount >= game.to_shove() {
-                    // Calling would commit the entire stack (or more) – convert to an all-in shove
-                    // so that the action is always legal in the game state.
-                    Action::Shove(game.to_shove())
                 } else {
+                    // Even if the call commits the entire stack, leave it as Call so
+                    // we distinguish an all-in *bet* (Shove) from an all-in *call*.
                     Action::Call(call_amount)
                 }
             }
@@ -97,6 +99,17 @@ impl Recall {
                     .collect::<Vec<Card>>()
                     .into();
                 Action::Draw(reveal)
+            }
+            // For user-supplied raises/shoves that are outside the legal range
+            // (e.g. "RAISE 1" when the min raise is 6) we mirror the logic in
+            // `Game::act` so that the edge we encode matches the action that
+            // will actually be applied to the game tree.
+            Action::Raise(_) | Action::Shove(_) => {
+                if game.is_allowed(&action) {
+                    action
+                } else {
+                    game.find_nearest_action(&action).unwrap_or(action)
+                }
             }
             other => other,
         }
@@ -163,10 +176,63 @@ impl Recall {
         let mut edges_vec = Vec::with_capacity(self.path.len());
         let mut game = self.root();
 
+        let mut depth = 0usize; // raises since last Draw
+
         for &raw_action in self.path.iter() {
             let adj = self.adjust_action(&game, raw_action);
-            edges_vec.push(game.edgify(adj));
-            game = game.apply(adj);
+
+            let mut action_for_game = adj; // may be replaced for raises
+
+            match adj {
+                Action::Draw(_) => {
+                    edges_vec.push(game.edgify(adj));
+                    depth = 0; // new betting round
+                    log::debug!(
+                        "ENCODE draw   | street={:?} depth→0 edge={:?}",
+                        game.street(),
+                        edges_vec.last().unwrap()
+                    );
+                }
+                Action::Raise(amount) => {
+                    let grid = BlueprintEncoder::raises(&game, depth);
+                    let odds = Odds::nearest_in(&grid, amount, game.pot());
+                    edges_vec.push(Edge::Raise(odds));
+                    depth += 1;
+
+                    // Snap amount to exact grid bet so game state matches blueprint expectation
+                    use crate::Probability;
+                    let snapped_amount = ((Probability::from(odds) * game.pot() as f32).round()) as Chips;
+                    action_for_game = Action::Raise(snapped_amount.max(game.to_raise()));
+                    log::debug!(
+                        "ENCODE raise  | amount={} pot={} depth={} odds={:?} edge={:?}",
+                        amount,
+                        game.pot(),
+                        depth - 1,
+                        odds,
+                        edges_vec.last().unwrap()
+                    );
+                }
+                Action::Shove(_) => {
+                    edges_vec.push(game.edgify(adj));
+                    depth += 1;
+                    log::debug!(
+                        "ENCODE shove  | depth={} edge={:?}",
+                        depth - 1,
+                        edges_vec.last().unwrap()
+                    );
+                }
+                _ => {
+                    edges_vec.push(game.edgify(adj));
+                    log::debug!(
+                        "ENCODE other  | action={:?} depth={} edge={:?}",
+                        adj,
+                        depth,
+                        edges_vec.last().unwrap()
+                    );
+                }
+            }
+
+            game = game.apply(action_for_game);
         }
 
         // Blueprint stores the most-recent edge in the least-significant nibble,
@@ -222,5 +288,14 @@ impl Recall {
     }
     pub fn can_revoke(&self) -> bool {
         matches!(self.path.last().expect("empty path"), Action::Draw(_))
+    }
+
+    /// Return the hero's seat index (0-based).  Defaults to 0 if `hero` is not
+    /// a `Choice` variant – that situation should not occur in normal use.
+    pub fn hero_position(&self) -> usize {
+        match self.hero {
+            Turn::Choice(idx) => idx,
+            _ => 0,
+        }
     }
 }

@@ -21,8 +21,11 @@ async fn main() {
     if arguments.evaluate {
         crate::mccfr::exploitability::evaluate().await;
     }
-    if arguments.generatepgdata {
-        crate::save::Converter::generate_pg_data();
+    if arguments.convert_blueprint_to_postgres {
+        crate::save::Converter::convert_blueprint_to_postgres();
+    }
+    if arguments.convert_blueprint_to_parquet {
+        crate::save::Converter::convert_blueprint_to_parquet();
     }
 }
 

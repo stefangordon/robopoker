@@ -93,9 +93,12 @@ pub struct Args {
     /// Run exploitability evaluation
     #[arg(long)]
     pub evaluate: bool,
-    /// Generate PostgreSQL-compatible data file from blueprint
+    /// Convert blueprint to PostgreSQL-compatible format
     #[arg(long)]
-    pub generatepgdata: bool,
+    pub convert_blueprint_to_postgres: bool,
+    /// Convert blueprint to Parquet format
+    #[arg(long)]
+    pub convert_blueprint_to_parquet: bool,
 }
 
 /// trait for random generation, mainly (strictly?) for testing

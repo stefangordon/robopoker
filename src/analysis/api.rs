@@ -18,18 +18,29 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_postgres::Client;
 use tokio_postgres::Error as E;
+use crate::mccfr::nlhe::encoder::BlueprintEncoder;
+use crate::mccfr::nlhe::encoder::Encoder as NLHEEncoder;
+use crate::mccfr::subgame::SubgameSizer;
+use crate::save::disk::Disk;
 
-pub struct API(Arc<Client>);
+pub struct API {
+    client: Arc<Client>,
+    encoder: NLHEEncoder<SubgameSizer>,
+}
 
 impl From<Arc<Client>> for API {
     fn from(client: Arc<Client>) -> Self {
-        Self(client)
+        log::info!("Loading abstractions for all streets...");
+        // Load the encoder with all street abstractions
+        let encoder = NLHEEncoder::<SubgameSizer>::load(Street::Pref);
+        log::info!("All abstractions loaded successfully");
+        Self { client, encoder }
     }
 }
 
 impl API {
     pub async fn new() -> Self {
-        Self(crate::db().await)
+        Self::from(crate::db().await)
     }
 
     // global lookups
@@ -41,7 +52,7 @@ impl API {
             WHERE obs = $1
         "#;
         Ok(self
-            .0
+            .client
             .query_one(SQL, &[&iso])
             .await?
             .get::<_, i64>(0)
@@ -63,7 +74,7 @@ impl API {
                 a1.abs     != a2.abs;
         "#;
         Ok(self
-            .0
+            .client
             .query(SQL, &[&street])
             .await?
             .iter()
@@ -81,7 +92,7 @@ impl API {
             WHERE a1.abs = $1;
         "#;
         Ok(self
-            .0
+            .client
             .query(SQL, &[&street])
             .await?
             .iter()
@@ -99,7 +110,7 @@ impl API {
             WHERE abs = $1
         "#;
         Ok(self
-            .0
+            .client
             .query_one(SQL, &[&iso])
             .await?
             .get::<_, f32>(0)
@@ -123,7 +134,7 @@ impl API {
             "#
         };
         Ok(self
-            .0
+            .client
             .query_one(sql, &[&iso])
             .await?
             .get::<_, f32>(0)
@@ -144,7 +155,7 @@ impl API {
             FROM metric m
             WHERE $1 = m.xor;
         "#;
-        Ok(self.0.query_one(SQL, &[&xor]).await?.get::<_, Energy>(0))
+        Ok(self.client.query_one(SQL, &[&xor]).await?.get::<_, Energy>(0))
     }
     pub async fn obs_distance(&self, obs1: Observation, obs2: Observation) -> Result<Energy, E> {
         if obs1.street() != obs2.street() {
@@ -166,7 +177,7 @@ impl API {
             FROM abstraction
             WHERE abs = $1
         "#;
-        Ok(self.0.query_one(SQL, &[&abs]).await?.get::<_, i32>(0) as usize)
+        Ok(self.client.query_one(SQL, &[&abs]).await?.get::<_, i32>(0) as usize)
     }
     pub async fn obs_population(&self, obs: Observation) -> Result<usize, E> {
         let iso = i64::from(Isomorphism::from(obs));
@@ -176,7 +187,7 @@ impl API {
             JOIN isomorphism ON isomorphism.abs = abstraction.abs
             WHERE obs = $1
         "#;
-        Ok(self.0.query_one(SQL, &[&iso]).await?.get::<_, i64>(0) as usize)
+        Ok(self.client.query_one(SQL, &[&iso]).await?.get::<_, i64>(0) as usize)
     }
 
     // centrality (mean distance) lookups
@@ -188,7 +199,7 @@ impl API {
             WHERE abs = $1
         "#;
         Ok(self
-            .0
+            .client
             .query_one(SQL, &[&abs])
             .await?
             .get::<_, f32>(0)
@@ -203,7 +214,7 @@ impl API {
             WHERE obs = $1
         "#;
         Ok(self
-            .0
+            .client
             .query_one(SQL, &[&iso])
             .await?
             .get::<_, f32>(0)
@@ -220,7 +231,7 @@ impl API {
             WHERE prev = $1
         "#;
         Ok(self
-            .0
+            .client
             .query(SQL, &[&idx])
             .await?
             .iter()
@@ -243,7 +254,7 @@ impl API {
             WHERE isomorphism.obs = $1
         "#;
         Ok(self
-            .0
+            .client
             .query(SQL, &[&idx])
             .await?
             .iter()
@@ -275,7 +286,7 @@ impl API {
             LIMIT 5;
         "#;
         Ok(self
-            .0
+            .client
             .query(SQL, &[&iso])
             .await?
             .iter()
@@ -297,7 +308,7 @@ impl API {
             LIMIT 5;
         "#;
         Ok(self
-            .0
+            .client
             .query(SQL, &[&abs])
             .await?
             .iter()
@@ -326,7 +337,7 @@ impl API {
         //
         let iso = i64::from(Isomorphism::from(obs));
         //
-        let row = self.0.query_one(SQL, &[&iso]).await?;
+        let row = self.client.query_one(SQL, &[&iso]).await?;
         Ok(Observation::from(row.get::<_, i64>(0)))
     }
 
@@ -345,7 +356,7 @@ impl API {
             LIMIT 5;
         "#;
         Ok(self
-            .0
+            .client
             .query(SQL, &[&abs])
             .await?
             .iter()
@@ -368,7 +379,7 @@ impl API {
             LIMIT 5;
         "#;
         Ok(self
-            .0
+            .client
             .query(SQL, &[&iso])
             .await?
             .iter()
@@ -400,7 +411,7 @@ impl API {
         let n = obs.street().n_observations() as f32;
         let iso = i64::from(Isomorphism::from(obs));
         //
-        let row = self.0.query_one(SQL, &[&iso, &n]).await?;
+        let row = self.client.query_one(SQL, &[&iso, &n]).await?;
         Ok(Sample::from(row))
     }
     pub async fn exp_wrt_abs(&self, abs: Abstraction) -> Result<Sample, E> {
@@ -431,7 +442,7 @@ impl API {
         let n = abs.street().n_isomorphisms() as f32;
         let abs = i64::from(abs);
         //
-        let row = self.0.query_one(SQL, &[&abs, &n]).await?;
+        let row = self.client.query_one(SQL, &[&abs, &n]).await?;
         Ok(Sample::from(row))
     }
 }
@@ -485,7 +496,7 @@ impl API {
         let abs = i64::from(abs);
         let wrt = i64::from(wrt);
         //
-        let row = self.0.query_one(SQL, &[&abs, &n, &wrt]).await?;
+        let row = self.client.query_one(SQL, &[&abs, &n, &wrt]).await?;
         Ok(Sample::from(row))
     }
     pub async fn nbr_obs_wrt_abs(&self, wrt: Abstraction, obs: Observation) -> Result<Sample, E> {
@@ -515,7 +526,7 @@ impl API {
         let iso = i64::from(Isomorphism::from(obs));
         let wrt = i64::from(wrt);
         //
-        let row = self.0.query_one(SQL, &[&iso, &n, &wrt]).await?;
+        let row = self.client.query_one(SQL, &[&iso, &n, &wrt]).await?;
         Ok(Sample::from(row))
     }
 
@@ -552,7 +563,7 @@ impl API {
         let s = wrt.street() as i16;
         let wrt = i64::from(wrt);
         //
-        let rows = self.0.query(SQL, &[&wrt, &s, &n]).await?;
+        let rows = self.client.query(SQL, &[&wrt, &s, &n]).await?;
         Ok(rows.into_iter().map(Sample::from).collect())
     }
     pub async fn knn_wrt_abs(&self, wrt: Abstraction) -> Result<Vec<Sample>, E> {
@@ -588,7 +599,7 @@ impl API {
         let s = wrt.street() as i16;
         let wrt = i64::from(wrt);
         //
-        let rows = self.0.query(SQL, &[&wrt, &s, &n]).await?;
+        let rows = self.client.query(SQL, &[&wrt, &s, &n]).await?;
         Ok(rows.into_iter().map(Sample::from).collect())
     }
     pub async fn kgn_wrt_abs(
@@ -623,7 +634,7 @@ impl API {
         let n = wrt.street().n_isomorphisms() as f32;
         let wrt = i64::from(wrt);
         //
-        let rows = self.0.query(SQL, &[&n, &wrt, &&isos]).await?;
+        let rows = self.client.query(SQL, &[&n, &wrt, &&isos]).await?;
         Ok(rows.into_iter().map(Sample::from).collect())
     }
 }
@@ -671,7 +682,7 @@ impl API {
         "#;
         let n = Street::Rive.n_isomorphisms() as f32;
         let iso = i64::from(Isomorphism::from(obs));
-        let rows = self.0.query(SQL, &[&n, &iso]).await?;
+        let rows = self.client.query(SQL, &[&n, &iso]).await?;
         Ok(rows.into_iter().map(Sample::from).collect())
     }
 
@@ -700,7 +711,7 @@ impl API {
             })
             .into_iter()
             .collect::<Vec<_>>();
-        let rows = self.0.query(SQL, &[&distinct]).await?;
+        let rows = self.client.query(SQL, &[&distinct]).await?;
         let rows = rows
             .into_iter()
             .map(|row| {
@@ -759,7 +770,7 @@ impl API {
         let ref n = Street::Rive.n_isomorphisms() as f32;
         let ref abs = i64::from(abs);
         //
-        let rows = self.0.query(SQL, &[n, abs]).await?;
+        let rows = self.client.query(SQL, &[n, abs]).await?;
         Ok(rows.into_iter().map(Sample::from).collect())
     }
     async fn hst_wrt_abs_on_other(&self, abs: Abstraction) -> Result<Vec<Sample>, E> {
@@ -792,7 +803,7 @@ impl API {
         //
         let ref abs = i64::from(abs);
         //
-        let rows = self.0.query(SQL, &[abs]).await?;
+        let rows = self.client.query(SQL, &[abs]).await?;
         Ok(rows.into_iter().map(Sample::from).collect())
     }
 }
@@ -807,13 +818,15 @@ impl API {
         let street = game.street();
         let pot = game.pot();
 
-        // Check if we should use subgame solving
-        if self.should_solve_subgame(street, pot, Self::stack_to_pot_ratio(&game)) {
-            return self.solve_subgame_unsafe(&recall).await;
+        // Check if we should solve a subgame for this situation
+        if self.should_solve_subgame(street, pot, Self::stack_to_pot_ratio(&game, recall.hero_position())) {
+            // Attempt to get blueprint policy for warm-starting.
+            let warm_start_strategy = self.blueprint_policy(&recall, true).await.unwrap_or(None);
+            return self.solve_subgame_unsafe(&recall, warm_start_strategy).await;
         }
 
         // Otherwise use existing blueprint lookup
-        self.blueprint_policy(&recall).await
+        self.blueprint_policy(&recall, false).await.map(|opt_vec| opt_vec.unwrap_or_default())
     }
 
     /// Determine if we should solve a subgame for this situation
@@ -826,7 +839,7 @@ impl API {
     }
 
     /// Stack-to-pot ratio helper
-    fn stack_to_pot_ratio(game: &Game) -> f32 {
+    fn stack_to_pot_ratio(game: &Game, _hero_position: usize) -> f32 {
         // Simplified SPR calculation
         // In most cases, we can estimate based on starting stacks and pot size
         let pot = game.pot() as f32;
@@ -843,24 +856,24 @@ impl API {
     }
 
     /// Solve a subgame with enhanced action abstraction
-    async fn solve_subgame_unsafe(&self, recall: &Recall) -> Result<Vec<Decision>, E> {
+    async fn solve_subgame_unsafe(&self, recall: &Recall, warm_start_strategy: Option<Vec<Decision>>) -> Result<Vec<Decision>, E> {
         use crate::mccfr::subgame::SubgameSolver;
-        
+
         let game = recall.head();
-        log::info!(
-            "Solving subgame at {:?} with pot {} (SPR: {:.2})", 
-            game.street(), 
+        log::debug!(
+            "Subgame solve: {:?} pot={} spr={:.1}",
+            game.street(),
             game.pot(),
-            Self::stack_to_pot_ratio(&game)
+            Self::stack_to_pot_ratio(&game, recall.hero_position())
         );
-        
-        // Get blueprint strategy for warm-start
-        let blueprint_strategy = self.blueprint_policy(recall).await?;
-        
-        // For now, use an empty abstraction lookup
-        // TODO: Load this from the database or encoder
-        let abstraction_lookup = std::collections::BTreeMap::new();
-        
+
+        // Use provided warm_start_strategy, or default to empty if None
+        let blueprint_strategy = warm_start_strategy.unwrap_or_default();
+
+        // Use the preloaded encoder's abstraction lookup
+        // Clone is necessary here because SubgameSolver takes ownership
+        let abstraction_lookup = self.encoder.get_lookup();
+
         // Use builder pattern for cleaner configuration
         let solver = SubgameSolver::builder()
             .with_game_state(game)
@@ -868,12 +881,12 @@ impl API {
             .with_iterations(500) // 5x minimum for better convergence
             .with_abstraction_lookup(abstraction_lookup)
             .build();
-            
+
         Ok(solver.solve().await)
     }
 
     /// Original blueprint policy lookup (renamed from policy)
-    async fn blueprint_policy(&self, recall: &Recall) -> Result<Vec<Decision>, E> {
+    async fn blueprint_policy(&self, recall: &Recall, for_warm_start_only: bool) -> Result<Option<Vec<Decision>>, E> {
         const SQL: &'static str = r#"
         -- policy is indexed by present, past, future
         -- and it returns a vector of decision probabilities
@@ -886,7 +899,7 @@ impl API {
             AND   future  = $3
         "#;
         let ref game = recall.head();
-        let observation = game.sweat();
+        let observation = game.sweat_for(recall.hero_position());
         let abstraction = self.obs_to_abs(observation).await?;
         let history = recall.path();
         let present = abstraction;
@@ -897,27 +910,48 @@ impl API {
 
         use crate::gameplay::edge::Edge as GEdge;
         let history_edges: Vec<GEdge> = Vec::<GEdge>::from(history.clone());
+        // The blueprint was generated with the number of raises **prior** to the
+        // opponent action that just led to the current node.  That action is
+        // stored in the least-significant nibble (the first element yielded by
+        // Path::into_iter).  We therefore skip it before we start counting
+        // aggressive moves in the current betting round so that the depth used
+        // for the FUTURE bucket matches the write-side.
         let depth = history_edges
             .iter()
-            .rev()                          // walk backwards from most recent
-            .take_while(|e| e.is_choice())   // stop at first chance edge (Draw)
-            .filter(|e| e.is_aggro())        // count only aggressive actions
+            .take_while(|e| e.is_choice())
+            .filter(|e| e.is_aggro())
             .count();
 
-        let futures = Path::from(crate::mccfr::nlhe::encoder::Encoder::choices(game, depth));
-        let ref history = i64::from(history);
-        let ref present = i64::from(present);
-        let ref futures = i64::from(futures);
-        let rows = self.0.query(SQL, &[history, present, futures]).await?;
+        let futures = Path::from(BlueprintEncoder::choices(game, depth));
+        let ref history_val = i64::from(history);
+        let ref present_val = i64::from(present);
+        let ref futures_val = i64::from(futures);
+        let rows = self.client.query(SQL, &[history_val, present_val, futures_val]).await?;
+
         if rows.is_empty() {
-            log::info!(
-                "policy lookup miss – past: {}, present: {}, future: {}, recall: {:?}",
-                history,
-                present,
-                futures,
-                recall
+            log::warn!("BP miss: past={} present={} future={} -> subgame", history_val, present_val, futures_val);
+            if for_warm_start_only {
+                return Ok(None); // For warm-start, a miss means no strategy to provide
+            } else {
+                // For a hard miss, solve subgame without warm-start info
+                return Ok(Some(self.solve_subgame_unsafe(&recall, None).await?));
+            }
+        }
+
+        // Extra debug information to help diagnose blueprint-misses.
+        if log::log_enabled!(log::Level::Trace) {
+            let fut_edges = BlueprintEncoder::choices(game, depth);
+            let raise_grid = BlueprintEncoder::raises(game, depth);
+            log::trace!(
+                "BP: street={:?} depth={} grid={:?} edges={:?} path={}",
+                game.street(),
+                depth,
+                raise_grid,
+                fut_edges,
+                *futures_val
             );
         }
-        Ok(rows.into_iter().map(Decision::from).collect())
+
+        Ok(Some(rows.into_iter().map(Decision::from).collect()))
     }
 }

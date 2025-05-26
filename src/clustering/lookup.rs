@@ -5,6 +5,9 @@ use crate::cards::street::Street;
 use crate::clustering::abstraction::Abstraction;
 use crate::clustering::histogram::Histogram;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use crate::save::disk::Disk;
 
 #[derive(Default)]
 /// this is the grand lookup table for all the Isomorphism -> Abstraction
@@ -67,7 +70,6 @@ mod tests {
     #[ignore]
     #[test]
     fn persistence() {
-        use crate::save::disk::Disk;
         let street = Street::Pref;
         let lookup = Lookup::grow(street);
         lookup.save();
@@ -106,8 +108,7 @@ impl crate::save::disk::Disk for Lookup {
     fn load(street: Street) -> Self {
         let ref path = Self::path(street);
         log::info!("{:<32}{:<32}", "loading     lookup", path);
-        use byteorder::ReadBytesExt;
-        use byteorder::BE;
+        use byteorder::{BE, ReadBytesExt};
         use std::fs::File;
         use std::io::BufReader;
         use std::io::Read;
@@ -115,7 +116,7 @@ impl crate::save::disk::Disk for Lookup {
         use std::io::SeekFrom;
         let ref file = File::open(path).expect(&format!("open {}", path));
         let mut lookup = BTreeMap::new();
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
         let ref mut buffer = [0u8; 2];
         reader.seek(SeekFrom::Start(19)).expect("seek past header");
         while reader.read_exact(buffer).is_ok() {
@@ -140,19 +141,50 @@ impl crate::save::disk::Disk for Lookup {
         let street = self.street();
         let ref path = Self::path(street);
         let ref mut file = File::create(path).expect(&format!("touch {}", path));
-        use byteorder::WriteBytesExt;
-        use byteorder::BE;
+        use byteorder::{BE, WriteBytesExt};
         use std::fs::File;
         use std::io::Write;
+        use std::io::BufWriter;
+        use std::mem::size_of;
+        // Use a large buffer (4 MB) for faster writes
+        const BUF: usize = 4 * 1024 * 1024;
+
+        let mut writer = BufWriter::with_capacity(BUF, file);
         log::info!("{:<32}{:<32}", "saving      lookup", path);
-        file.write_all(Self::header()).expect("header");
+        writer.write_all(Self::header()).expect("header");
         for (Isomorphism(obs), abs) in self.0.iter() {
-            file.write_u16::<BE>(N_FIELDS).unwrap();
-            file.write_u32::<BE>(size_of::<i64>() as u32).unwrap();
-            file.write_i64::<BE>(i64::from(*obs)).unwrap();
-            file.write_u32::<BE>(size_of::<i64>() as u32).unwrap();
-            file.write_i64::<BE>(i64::from(*abs)).unwrap();
+            writer.write_u16::<BE>(N_FIELDS).unwrap();
+            writer.write_u32::<BE>(size_of::<i64>() as u32).unwrap();
+            writer.write_i64::<BE>(i64::from(*obs)).unwrap();
+            writer.write_u32::<BE>(size_of::<i64>() as u32).unwrap();
+            writer.write_i64::<BE>(i64::from(*abs)).unwrap();
         }
-        file.write_u16::<BE>(Self::footer()).expect("trailer");
+        writer.write_u16::<BE>(Self::footer()).expect("trailer");
+        writer.flush().expect("flush writer");
+    }
+}
+
+// Static caches so large lookups are loaded once per process.
+static PREF_LOOKUP: OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>> = OnceLock::new();
+static FLOP_LOOKUP: OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>> = OnceLock::new();
+static TURN_LOOKUP: OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>> = OnceLock::new();
+static RIVE_LOOKUP: OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>> = OnceLock::new();
+
+fn init_lookup(cell: &OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>>, street: Street) -> Arc<BTreeMap<Isomorphism, Abstraction>> {
+    cell.get_or_init(|| {
+        log::info!("loading abstraction lookup for {:?}", street);
+        let lookup: Lookup = <Lookup as Disk>::load(street);
+        Arc::new(lookup.into())
+    }).clone()
+}
+
+/// Retrieve a cached abstraction lookup for the given street.  Heavy files are
+/// loaded exactly once (on first access) and then shared via `Arc`.
+pub fn cached(street: Street) -> Arc<BTreeMap<Isomorphism, Abstraction>> {
+    match street {
+        Street::Pref => init_lookup(&PREF_LOOKUP, Street::Pref),
+        Street::Flop => init_lookup(&FLOP_LOOKUP, Street::Flop),
+        Street::Turn => init_lookup(&TURN_LOOKUP, Street::Turn),
+        Street::Rive => init_lookup(&RIVE_LOOKUP, Street::Rive),
     }
 }
