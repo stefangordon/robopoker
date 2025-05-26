@@ -8,6 +8,7 @@
 //! - `traits`: Generic traits that can be implemented for any tree-based game
 //! - `types`: Type aliases and common types used across CFR implementations
 //! - `subgame`: Subgame solving for improved strategies in critical situations
+//! - `core`: Core module for common utilities and shared functionality
 //!
 //! The module provides both concrete game implementations (`nlhe`, `rps`) as well as
 //! generic infrastructure (`structs`, `traits`, `types`) that can be reused for
@@ -19,6 +20,7 @@ pub mod nlhe;
 pub mod rps;
 pub mod structs;
 pub mod subgame;
+pub mod core;
 pub mod traits;
 pub mod types;
 

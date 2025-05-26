@@ -29,18 +29,15 @@
 //! let strategy = solver.solve().await;
 //! ```
 
-mod profile;
 mod solver;
 
 pub use solver::{SubgameSolver, SubgameSolverBuilder};
 
 // Re-export types needed by subgame solving
 use crate::mccfr::nlhe::{Edge, Game, Info, Turn};
-use crate::mccfr::types::policy::Policy;
 use crate::gameplay::odds::Odds;
 
 // Internal use only
-use profile::SubgameProfile;
 use crate::mccfr::nlhe::encoder::BetSizer;
 
 /// Enhanced bet sizes for subgame solving using the full preflop grid (10 sizes from 0.25x to 4x pot)

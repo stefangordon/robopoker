@@ -336,23 +336,23 @@ impl Converter {
             vec![Encoding::Plain],      // policy
         ];
 
-        // Write options
+        // Write options - optimized for speed
         let options = WriteOptions {
-            write_statistics: true,
-            compression: CompressionOptions::Zstd(None),
+            write_statistics: true, // Keep statistics for better query performance
+            compression: CompressionOptions::Lz4, // Much faster than zstd
             version: Version::V2,
-            data_pagesize_limit: Some(512 * 1024), // 512KB pages
+            data_pagesize_limit: Some(1024 * 1024), // Larger 1MB pages for better throughput
         };
 
-        // Create output file and writer
+        // Create output file and writer with larger buffer for better performance
         let file = File::create(&output_path)
             .expect(&format!("Failed to create file at {}", output_path.display()));
-        let writer_inner = BufWriter::new(file);
+        let writer_inner = BufWriter::with_capacity(8 * 1024 * 1024, file); // 8MB buffer
         let mut writer = FileWriter::try_new(writer_inner, schema.clone(), options)
             .expect("Failed to create parquet writer");
 
         // Process records in chunks to avoid loading everything into memory
-        const RECORDS_PER_CHUNK: usize = 100_000; // Process 100k records at a time
+        const RECORDS_PER_CHUNK: usize = 1_000_000; // Process 1M records at a time for better performance
         let mut records_processed = 0;
 
         for chunk_start in (0..total_records).step_by(RECORDS_PER_CHUNK) {
@@ -422,9 +422,13 @@ impl Converter {
                     .expect("Failed to write row group");
             }
 
-            // Log progress
-            let percentage = (records_processed * 100) / total_records;
-            log::info!("Conversion progress: {}% ({} / {} records)", percentage, records_processed, total_records);
+            // Log progress less frequently for large datasets
+            let log_every_chunk = if total_records > 100_000_000 { 10 } else { 1 }; // Every 10th chunk for large datasets
+            let chunk_number = (chunk_start / RECORDS_PER_CHUNK) + 1; // Use chunk_start for correct chunk number
+            if chunk_number % log_every_chunk == 0 || records_processed == total_records {
+                let percentage = (records_processed * 100) / total_records;
+                log::info!("Conversion progress: {}% ({} / {} records)", percentage, records_processed, total_records);
+            }
         }
 
         // Finalize the parquet file

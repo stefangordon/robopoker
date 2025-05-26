@@ -28,6 +28,7 @@ use arrow2::{
     },
 };
 use std::sync::Arc;
+use crate::analysis::response::Decision;
 
 // File format constants and specifications
 //
@@ -172,6 +173,53 @@ impl Profile {
         log::info!("  [100, 1k):   {} edges", policy_buckets[3]);
         log::info!("  >= 1k:       {} edges", policy_buckets[4]);
         log::info!("-----------------------------------------------------");
+    }
+
+    /// Seed initial policy weights (and zero regrets) for a given infoset.
+    pub fn seed_decisions(&self, info: &Info, decisions: &[Decision]) {
+        if decisions.is_empty() {
+            return;
+        }
+        let bucket_mutex = self
+            .encounters
+            .entry(*info)
+            .or_insert_with(|| Mutex::new(SmallVec::new()));
+        let mut bucket = bucket_mutex.lock();
+        // Normalise weights to sum to 1.
+        let total: f32 = decisions.iter().map(|d| d.weight()).sum();
+        let total = total.max(crate::POLICY_MIN);
+        for d in decisions {
+            let w = d.weight() / total;
+            bucket.push((d.edge(), (half::f16::from_f32(w), 0.0)));
+        }
+    }
+
+    /// Apply regret/policy deltas concurrently-safe (called by subgame solver).
+    pub fn apply_updates(&self, updates: Vec<(Info, crate::mccfr::types::policy::Policy<Edge>, crate::mccfr::types::policy::Policy<Edge>)>) {
+        for (info, regret_vec, policy_vec) in updates {
+            let bucket_mutex = self
+                .encounters
+                .entry(info)
+                .or_insert_with(|| Mutex::new(SmallVec::new()));
+            let mut bucket = bucket_mutex.lock();
+            // Update regrets
+            for (edge, delta) in regret_vec {
+                if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
+                    existing.1 .1 += delta; // add to regret part
+                } else {
+                    bucket.push((edge, (f16::from_f32(0.0), delta)));
+                }
+            }
+            // Update policies
+            for (edge, delta) in policy_vec {
+                if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
+                    let prev = f32::from(existing.1 .0);
+                    existing.1 .0 = f16::from_f32(prev + delta);
+                } else {
+                    bucket.push((edge, (f16::from_f32(delta), 0.0)));
+                }
+            }
+        }
     }
 }
 
@@ -409,56 +457,7 @@ impl Profile {
             .map(|entry| entry.value().lock().len())
             .sum();
 
-        log::info!("Saving blueprint to {} ({} records)", path_str, total_records);
-
-        // Collect all records into vectors for columnar storage
-        let mut histories = Vec::with_capacity(total_records);
-        let mut presents = Vec::with_capacity(total_records);
-        let mut futures = Vec::with_capacity(total_records);
-        let mut edges = Vec::with_capacity(total_records);
-        let mut regrets = Vec::with_capacity(total_records);
-        let mut policies = Vec::with_capacity(total_records);
-
-        let mut written_records = 0;
-        let log_every_n = (total_records / 100).max(1);
-
-        for bucket_entry in self.encounters.iter() {
-            let bucket = bucket_entry.key();
-            let edges_vec = bucket_entry.value().lock();
-
-            for (edge, (policy, regret)) in edges_vec.iter() {
-                histories.push(u64::from(*bucket.history()) as i64);
-                presents.push(u64::from(*bucket.present()) as i64);
-                futures.push(u64::from(*bucket.futures()) as i64);
-                edges.push(u64::from(edge.clone()) as u32);
-                regrets.push(*regret);
-                policies.push(f32::from(*policy));
-
-                written_records += 1;
-
-                if written_records % log_every_n == 0 || written_records == total_records {
-                    let percentage = (written_records * 100) / total_records;
-                    log::info!("Collecting blueprint data: {}%", percentage);
-                }
-            }
-        }
-
-        // Create arrow arrays
-        let hist_array = Int64Array::from_slice(&histories);
-        let pres_array = Int64Array::from_slice(&presents);
-        let fut_array = Int64Array::from_slice(&futures);
-        let edge_array = UInt32Array::from_slice(&edges);
-        let regret_array = Float32Array::from_slice(&regrets);
-        let policy_array = Float32Array::from_slice(&policies);
-
-        let columns: Vec<Arc<dyn Array>> = vec![
-            Arc::new(hist_array),
-            Arc::new(pres_array),
-            Arc::new(fut_array),
-            Arc::new(edge_array),
-            Arc::new(regret_array),
-            Arc::new(policy_array),
-        ];
+                log::info!("Saving blueprint to {} ({} records)", path_str, total_records);
 
         // Create schema
         let schema = Schema::from(vec![
@@ -480,38 +479,146 @@ impl Profile {
             vec![Encoding::Plain],      // policy
         ];
 
-        // Write options
+        // Write options - optimized for speed
         let options = WriteOptions {
-            write_statistics: true,
-            compression: CompressionOptions::Zstd(None),
+            write_statistics: true, // Keep statistics for better query performance
+            compression: CompressionOptions::Lz4, // Much faster than zstd
             version: Version::V2,
-            data_pagesize_limit: Some(512 * 1024), // 512KB pages
+            data_pagesize_limit: Some(1024 * 1024), // Larger 1MB pages for better throughput
         };
 
-        // Create chunk
-        let chunk = Chunk::new(columns);
-
-        // Create row group iterator
-        let row_groups = RowGroupIterator::try_new(
-            vec![Ok(chunk)].into_iter(),
-            &schema,
-            options,
-            encodings,
-        ).expect("Failed to create row group iterator");
-
-        // Write to file
+        // Create output file and writer
         let file = File::create(path).expect(&format!("Failed to create file at {}", path_str));
-        let writer_inner = BufWriter::new(file);
-        let mut writer = FileWriter::try_new(writer_inner, schema, options)
+        let writer_inner = BufWriter::with_capacity(8 * 1024 * 1024, file); // 8MB buffer
+        let mut writer = FileWriter::try_new(writer_inner, schema.clone(), options)
             .expect("Failed to create parquet writer");
 
+        // Stream data in chunks to avoid doubling memory usage
+        const RECORDS_PER_CHUNK: usize = 1_000_000; // Process 1M records at a time
+        let mut written_records = 0;
+        let log_every_n = (total_records / 20).max(10_000_000); // Log every 5% or 10M records, whichever is larger
+
+        let mut chunk_histories = Vec::with_capacity(RECORDS_PER_CHUNK);
+        let mut chunk_presents = Vec::with_capacity(RECORDS_PER_CHUNK);
+        let mut chunk_futures = Vec::with_capacity(RECORDS_PER_CHUNK);
+        let mut chunk_edges = Vec::with_capacity(RECORDS_PER_CHUNK);
+        let mut chunk_regrets = Vec::with_capacity(RECORDS_PER_CHUNK);
+        let mut chunk_policies = Vec::with_capacity(RECORDS_PER_CHUNK);
+
+        for bucket_entry in self.encounters.iter() {
+            let bucket = bucket_entry.key();
+            let edges_vec = bucket_entry.value().lock();
+
+            for (edge, (policy, regret)) in edges_vec.iter() {
+                chunk_histories.push(u64::from(*bucket.history()) as i64);
+                chunk_presents.push(u64::from(*bucket.present()) as i64);
+                chunk_futures.push(u64::from(*bucket.futures()) as i64);
+                chunk_edges.push(u64::from(edge.clone()) as u32); // Note: Edge values must fit in u32
+                chunk_regrets.push(*regret);
+                chunk_policies.push(f32::from(*policy));
+
+                written_records += 1;
+
+                // Write chunk when it's full
+                if chunk_histories.len() >= RECORDS_PER_CHUNK {
+                    Self::write_parquet_chunk(
+                        &mut writer,
+                        &schema,
+                        &options,
+                        &encodings,
+                        &chunk_histories,
+                        &chunk_presents,
+                        &chunk_futures,
+                        &chunk_edges,
+                        &chunk_regrets,
+                        &chunk_policies,
+                    );
+
+                    // Clear chunks for next batch
+                    chunk_histories.clear();
+                    chunk_presents.clear();
+                    chunk_futures.clear();
+                    chunk_edges.clear();
+                    chunk_regrets.clear();
+                    chunk_policies.clear();
+                }
+
+                if written_records % log_every_n == 0 {
+                    let percentage = (written_records * 100) / total_records;
+                    log::info!("Streaming blueprint data: {}% ({} records)", percentage, written_records);
+                }
+            }
+        }
+
+        // Write final partial chunk if any records remain
+        if !chunk_histories.is_empty() {
+            Self::write_parquet_chunk(
+                &mut writer,
+                &schema,
+                &options,
+                &encodings,
+                &chunk_histories,
+                &chunk_presents,
+                &chunk_futures,
+                &chunk_edges,
+                &chunk_regrets,
+                &chunk_policies,
+            );
+        }
+
+        let _size = writer.end(None).expect("Failed to finalize parquet file");
+        log::info!("Completed streaming {} records to parquet file", written_records);
+        
+        // Final progress log
+        let percentage = (written_records * 100) / total_records;
+        log::info!("Final: {}% ({} / {} records)", percentage, written_records, total_records);
+    }
+
+    /// Helper function to write a chunk of data to the parquet file
+    #[cfg(feature = "native")]
+    fn write_parquet_chunk(
+        writer: &mut FileWriter<std::io::BufWriter<std::fs::File>>,
+        schema: &Schema,
+        options: &WriteOptions,
+        encodings: &[Vec<Encoding>],
+        histories: &[i64],
+        presents: &[i64],
+        futures: &[i64],
+        edges: &[u32],
+        regrets: &[f32],
+        policies: &[f32],
+    ) {
+        // Create arrow arrays for this chunk
+        let hist_array = Int64Array::from_slice(histories);
+        let pres_array = Int64Array::from_slice(presents);
+        let fut_array = Int64Array::from_slice(futures);
+        let edge_array = UInt32Array::from_slice(edges);
+        let regret_array = Float32Array::from_slice(regrets);
+        let policy_array = Float32Array::from_slice(policies);
+
+        let columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(hist_array),
+            Arc::new(pres_array),
+            Arc::new(fut_array),
+            Arc::new(edge_array),
+            Arc::new(regret_array),
+            Arc::new(policy_array),
+        ];
+
+        // Create chunk and write as row group
+        let chunk = Chunk::new(columns);
+        let row_groups = RowGroupIterator::try_new(
+            vec![Ok(chunk)].into_iter(),
+            schema,
+            *options,
+            encodings.to_vec(),
+        ).expect("Failed to create row group iterator");
+
+        // Write this chunk as a row group
         for group in row_groups {
             writer.write(group.expect("Failed to get row group"))
                 .expect("Failed to write row group");
         }
-
-        let _size = writer.end(None).expect("Failed to finalize parquet file");
-        log::info!("Completed saving {} records to parquet file", written_records);
     }
 
     /// Load profile data from Apache Parquet format.
@@ -526,19 +633,21 @@ impl Profile {
         log::info!("{:<32}{:<32}", "loading     blueprint", path_str);
 
         let mut file = File::open(&path_str).expect(&format!("Failed to open blueprint file: {}", path_str));
-        
+
         // Read metadata
         let metadata = read_metadata(&mut file).expect("Failed to read parquet metadata");
-        
+
         // Infer schema
         let schema = infer_schema(&metadata).expect("Failed to infer schema");
-        
-        log::info!("Loading blueprint from {} row groups", metadata.row_groups.len());
 
-        let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> = 
-            DashMap::with_hasher(FxBuildHasher::default());
+        let total_rows: usize = metadata.row_groups.iter().map(|rg| rg.num_rows() as usize).sum();
+        log::info!("Loading blueprint from {} row groups ({} total rows)", metadata.row_groups.len(), total_rows);
+
+        let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> =
+            DashMap::with_capacity_and_hasher(total_rows / 4, FxBuildHasher::default()); // Pre-allocate capacity
 
         let mut total_records = 0;
+        let log_every_n = (total_rows / 20).max(10_000_000); // Log every 5% or 10M records, whichever is larger
 
         // Process each row group
         for (rg_idx, row_group) in metadata.row_groups.iter().enumerate() {
@@ -555,7 +664,7 @@ impl Profile {
             // Read the chunk
             for chunk_result in chunks {
                 let chunk = chunk_result.expect("Failed to read chunk");
-                
+
                 // Get arrays from chunk
                 let arrays = chunk.arrays();
                 if arrays.len() != 6 {
@@ -594,10 +703,19 @@ impl Profile {
                     bucket.push((edge, (f16::from_f32(policy), regret)));
 
                     total_records += 1;
+
+                    // Log progress less frequently for large datasets
+                    if total_records % log_every_n == 0 {
+                        let percentage = (total_records * 100) / total_rows;
+                        log::info!("Loading blueprint data: {}% ({} records)", percentage, total_records);
+                    }
                 }
             }
 
-            log::info!("Loaded row group {} ({} rows)", rg_idx + 1, row_group.num_rows());
+            // Only log row group completion for smaller datasets or every 10th row group
+            if total_rows < 100_000_000 || (rg_idx + 1) % 10 == 0 || rg_idx + 1 == metadata.row_groups.len() {
+                log::info!("Loaded row group {} of {} ({} rows)", rg_idx + 1, metadata.row_groups.len(), row_group.num_rows());
+            }
         }
 
         log::info!("Loaded {} total records from parquet file", total_records);
@@ -692,5 +810,54 @@ impl BuildHasher for FxBuildHasher {
 
     fn build_hasher(&self) -> Self::Hasher {
         FxHasher::default()
+    }
+}
+
+// -------------------------------------------------------------------
+// ProfileBuilder – constructs a Profile with optional warm-start and
+// tunable regret bounds.  The regret caps are not yet wired into the
+// legacy Profile implementation; they are stored for future use so the
+// caller can still query / log them.  Sub-game solvers can pull the
+// warm-start vector out immediately after build() and seed it once the
+// root Info is known.
+// -------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct ProfileBuilder {
+    warm_start: Vec<Decision>,
+    regret_min: f32,
+    regret_max: f32,
+}
+
+impl ProfileBuilder {
+    /// Start a builder with default global regret caps and no warm-start.
+    pub fn new() -> Self {
+        Self {
+            warm_start: Vec::new(),
+            regret_min: crate::REGRET_MIN,
+            regret_max: crate::REGRET_MAX,
+        }
+    }
+
+    /// Attach a warm-start strategy that will be returned alongside the
+    /// constructed profile.
+    pub fn with_warm_start(mut self, strategy: Vec<Decision>) -> Self {
+        self.warm_start = strategy;
+        self
+    }
+
+    /// Customise regret clamping bounds (not yet threaded through).
+    pub fn with_regret_bounds(mut self, min: f32, max: f32) -> Self {
+        self.regret_min = min;
+        self.regret_max = max;
+        self
+    }
+
+    /// Build the DashMap-based Profile.  Returns the profile together with
+    /// the warm-start vector so the caller can initialise the root infoset
+    /// once it is known.
+    pub fn build(self) -> (Profile, Vec<Decision>) {
+        // TODO: patch Profile to make use of regret_min / regret_max.
+        (Profile::default(), self.warm_start)
     }
 }
