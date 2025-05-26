@@ -289,29 +289,76 @@ impl SubgameProfile {
         let mut total_regret = 0.0;
 
         for (info, regret_vec, policy_vec) in updates {
-            // Apply regret updates
-            for (edge, regret) in regret_vec {
+            // Apply regret updates (using same logic as NLHE solver)
+            for (edge, regret_delta) in regret_vec {
                 let key = (Self::canonical(&info), edge);
-                self.regrets.entry(key)
-                    .and_modify(|r| *r = (*r + regret).clamp(self.params.regret_min, self.params.regret_max))
-                    .or_insert(regret);
+                
+                // Get current regret value
+                let current_regret = self.regrets.get(&key).copied().unwrap_or(0.0);
+                
+                // Apply discount factor (same as NLHE solver)
+                let discount = self.discount_factor(Some(current_regret));
+                
+                // Update: discounted_current + delta, then clamp
+                let updated_regret = (current_regret * discount + regret_delta)
+                    .clamp(crate::REGRET_MIN, crate::REGRET_MAX);
+                
+                self.regrets.insert(key, updated_regret);
                 regret_count += 1;
-                total_regret += regret.abs();
+                total_regret += regret_delta.abs();
             }
 
-            // Apply policy updates (weighted by current iteration for averaging)
-            for (edge, policy) in policy_vec {
+            // Apply policy updates (using same logic as NLHE solver)
+            for (edge, policy_delta) in policy_vec {
                 let key = (Self::canonical(&info), edge);
-                let weight = policy * (self.iterations as f32 + 1.0);
-                self.policies.entry(key)
-                    .and_modify(|p| *p += weight)
-                    .or_insert(weight);
+                
+                // Get current policy value
+                let current_policy = self.policies.get(&key).copied().unwrap_or(0.0);
+                
+                // Apply discount factor (neutral for policies)
+                let discount = self.discount_factor(None);
+                
+                // Update: discounted_current + delta, then clamp
+                let updated_policy = (current_policy * discount + policy_delta)
+                    .max(crate::POLICY_MIN);
+                
+                self.policies.insert(key, updated_policy);
             }
         }
 
         if regret_count > 0 {
             log::trace!("Applied {} regret updates, avg magnitude: {:.6}",
                        regret_count, total_regret / regret_count as f32);
+        }
+    }
+
+    /// Discount factor calculation (same as NLHE solver)
+    fn discount_factor(&self, regret: Option<f32>) -> f32 {
+        match regret {
+            None => {
+                // Policy discount (neutral)
+                let t = self.iterations as f32;
+                (t / (t + 1.0)).powf(1.5) // gamma = 1.5
+            }
+            Some(r) => {
+                // Regret discount (depends on sign)
+                let t = self.iterations as f32;
+                if t % 1.0 != 0.0 {
+                    1.0
+                } else if r > 0.0 {
+                    // Positive regrets get discounted more aggressively
+                    let x = t.powf(1.5); // alpha = 1.5
+                    x / (x + 1.0)
+                } else if r < 0.0 {
+                    // Negative regrets get discounted less aggressively
+                    let x = t.powf(0.5); // omega = 0.5
+                    x / (x + 1.0)
+                } else {
+                    // Zero regrets get neutral discount
+                    let x = t;
+                    x / (x + 1.0)
+                }
+            }
         }
     }
 

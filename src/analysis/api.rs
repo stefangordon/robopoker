@@ -1011,6 +1011,18 @@ impl API {
             );
         }
 
-        Ok(Some(rows.into_iter().map(Decision::from).collect()))
+        let decisions: Vec<Decision> = rows.into_iter().map(Decision::from).collect();
+        
+        // Normalize the policy weights to sum to 1.0 (same as blueprint does)
+        let total_weight: f32 = decisions.iter().map(|d| d.weight()).sum();
+        let normalized_decisions = if total_weight > 0.0 {
+            decisions.into_iter().map(|d| {
+                Decision::from((d.edge(), d.weight() / total_weight))
+            }).collect()
+        } else {
+            decisions
+        };
+        
+        Ok(Some(normalized_decisions))
     }
 }

@@ -15,34 +15,30 @@ pub struct Sample {
 
 #[derive(Serialize, Clone)]
 pub struct Decision {
-    pub edge: String,
+    #[serde(serialize_with = "serialize_edge")]
+    pub edge: Edge,
     pub prob: Probability,
+}
+
+fn serialize_edge<S>(edge: &Edge, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let edge_str = match edge {
+        Edge::Draw => "?".to_string(),
+        Edge::Fold => "F".to_string(),
+        Edge::Check => "O".to_string(),
+        Edge::Call => "*".to_string(),
+        Edge::Shove => "!".to_string(),
+        Edge::Raise(odds) => format!("{}:{}", odds.0, odds.1), // Use precise ratio format
+    };
+    serializer.serialize_str(&edge_str)
 }
 
 impl Decision {
     /// Get the edge for this decision
     pub fn edge(&self) -> Edge {
-        // Parse the edge string back to Edge
-        // This is a bit hacky but works for now
-        match self.edge.as_str() {
-            "?" => Edge::Draw,
-            "F" => Edge::Fold,
-            "O" => Edge::Check,
-            "*" => Edge::Call,
-            "!" => Edge::Shove,
-            s => {
-                // Handle raise format like "3:2"
-                if let Some((num, den)) = s.split_once(':') {
-                    if let (Ok(n), Ok(d)) = (num.parse::<i16>(), den.parse::<i16>()) {
-                        Edge::Raise(crate::gameplay::odds::Odds(n, d))
-                    } else {
-                        Edge::Check // Default fallback
-                    }
-                } else {
-                    Edge::Check // Default fallback
-                }
-            }
-        }
+        self.edge
     }
     
     /// Get the probability/weight for this decision
@@ -54,7 +50,7 @@ impl Decision {
 impl From<(Edge, Probability)> for Decision {
     fn from((edge, prob): (Edge, Probability)) -> Self {
         Self {
-            edge: edge.to_string(),
+            edge,
             prob,
         }
     }
@@ -75,7 +71,7 @@ impl From<tokio_postgres::Row> for Sample {
 impl From<tokio_postgres::Row> for Decision {
     fn from(row: tokio_postgres::Row) -> Self {
         Self {
-            edge: Edge::from(row.get::<_, i64>("edge") as u8).to_string(),
+            edge: Edge::from(row.get::<_, i64>("edge") as u64),
             prob: Probability::from(row.get::<_, f32>("policy")),
         }
     }
