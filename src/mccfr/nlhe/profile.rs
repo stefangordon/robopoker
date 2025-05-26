@@ -15,28 +15,36 @@ use rustc_hash::FxHasher;
 use std::hash::BuildHasher;
 use half::f16;
 #[cfg(feature = "native")]
-use memmap2::MmapOptions;
+use arrow2::{
+    array::{Int64Array, UInt32Array, Float32Array, Array},
+    chunk::Chunk,
+    datatypes::{DataType, Field, Schema},
+    io::parquet::{
+        read::{FileReader, RowGroupReader},
+        write::{
+            CompressionOptions, Encoding, FileWriter, RowGroupIterator,
+            Version, WriteOptions
+        },
+    },
+};
+use std::sync::Arc;
 
 // File format constants and specifications
 //
 // Two formats are supported:
 // 1. Legacy: zstd-compressed PostgreSQL binary COPY format (detected by zstd magic bytes)
-// 2. Current: Uncompressed memory-mapped binary format (default for new saves)
+// 2. Current: Parquet format with zstd compression (default for new saves)
 //
 // Legacy Format: [zstd header][19-byte PG header][records...][trailer]
-// Current Format: [8-byte record count][40-byte records...]
-//
-// Current format record layout (little-endian):
-// - history: 8 bytes (u64)
-// - present: 8 bytes (u64)
-// - futures: 8 bytes (u64)
-// - edge: 8 bytes (u64)
-// - regret: 4 bytes (f32)
-// - policy: 4 bytes (f32)
+// Parquet Format: Standard Apache Parquet with schema:
+//   - history: INT64
+//   - present: INT64
+//   - futures: INT64
+//   - edge: UINT32
+//   - regret: FLOAT32
+//   - policy: FLOAT32
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-const MMAP_RECORD_SIZE: usize = 40; // 8+8+8+8+4+4 bytes per record
-const MMAP_HEADER_SIZE: usize = 8; // record count header
 const PGCOPY_RECORD_SIZE: usize = 66; // 2-byte header already consumed + 64 payload
 const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
 const CHUNK_SIZE: usize = 1000; // Processing chunk size for better cache performance
@@ -317,8 +325,8 @@ impl crate::save::disk::Disk for Profile {
     fn path(_: Street) -> String {
         let current_dir = std::env::current_dir().unwrap_or_default();
         let path = PathBuf::from(current_dir)
-            .join("pgcopy")
-            .join(Self::name());
+            .join("data")
+            .join(format!("{}.parquet", Self::name()));
 
         path.to_string_lossy().into_owned()
     }
@@ -339,17 +347,17 @@ impl crate::save::disk::Disk for Profile {
             log::debug!("Detected zstd-compressed PostgreSQL binary format (legacy)");
             Self::load_legacy_pgcopy()
         } else {
-            log::debug!("Detected new mmap binary format");
-            Self::load_mmap()
+            log::debug!("Detected parquet format");
+            Self::load_parquet()
         }
     }
-        fn save(&self) {
+    fn save(&self) {
         if std::env::var("BLUEPRINT_STATS").is_ok() {
             // If caller only wants statistics, skip expensive serialization
             self.log_stats();
         } else {
-            // Use optimized mmap format for all saves
-            self.save_mmap();
+            // Use parquet format for all saves
+            self.save_parquet();
         }
     }
 }
@@ -381,13 +389,13 @@ impl Profile {
         self.iterations += bucket_count;
     }
 
-        /// Save profile data using memory-mapped I/O with the new binary format.
-    /// This is now the default save format. Maps a file into memory and writes directly to the mapped region.
+    /// Save profile data using Apache Parquet format with zstd compression.
+    /// This is now the default save format.
     #[cfg(feature = "native")]
-    pub fn save_mmap(&self) {
-        use byteorder::{ByteOrder, LittleEndian};
+    pub fn save_parquet(&self) {
         use crate::save::disk::Disk;
-        use std::fs::OpenOptions;
+        use std::fs::File;
+        use std::io::BufWriter;
 
         let path_str = Self::path(Street::random());
         let path = std::path::Path::new(&path_str);
@@ -397,139 +405,204 @@ impl Profile {
             std::fs::create_dir_all(parent).expect("Failed to create parent directories");
         }
 
-        // Calculate total records and file size
+        // Calculate total records
         let total_records: usize = self.encounters.iter()
             .map(|entry| entry.value().lock().len())
             .sum();
-        let file_size = MMAP_HEADER_SIZE + (total_records * MMAP_RECORD_SIZE);
 
-        log::info!("Saving blueprint to {} ({} records, {} bytes)",
-                   path_str, total_records, file_size);
+        log::info!("Saving blueprint to {} ({} records)", path_str, total_records);
 
-        // Create and size the file
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(path)
-            .expect(&format!("Failed to create file at {}", path_str));
+        // Collect all records into vectors for columnar storage
+        let mut histories = Vec::with_capacity(total_records);
+        let mut presents = Vec::with_capacity(total_records);
+        let mut futures = Vec::with_capacity(total_records);
+        let mut edges = Vec::with_capacity(total_records);
+        let mut regrets = Vec::with_capacity(total_records);
+        let mut policies = Vec::with_capacity(total_records);
 
-        file.set_len(file_size as u64).expect("Failed to set file size");
-
-        // Memory map the file for writing
-        let mut mmap = unsafe {
-            MmapOptions::new()
-                .map_mut(&file)
-                .expect("Failed to mmap file for writing")
-        };
-
-        // Write header: total record count
-        LittleEndian::write_u64(&mut mmap[0..MMAP_HEADER_SIZE], total_records as u64);
-
-        // Write records directly to mapped memory
-        let mut offset = MMAP_HEADER_SIZE;
         let mut written_records = 0;
         let log_every_n = (total_records / 100).max(1);
 
         for bucket_entry in self.encounters.iter() {
             let bucket = bucket_entry.key();
-            let edges = bucket_entry.value().lock();
+            let edges_vec = bucket_entry.value().lock();
 
-            for (edge, (policy, regret)) in edges.iter() {
-                // Write record: history(8) + present(8) + futures(8) + edge(8) + regret(4) + policy(4)
-                LittleEndian::write_u64(&mut mmap[offset..offset+8], u64::from(*bucket.history()));
-                LittleEndian::write_u64(&mut mmap[offset+8..offset+16], u64::from(*bucket.present()));
-                LittleEndian::write_u64(&mut mmap[offset+16..offset+24], u64::from(*bucket.futures()));
-                LittleEndian::write_u64(&mut mmap[offset+24..offset+32], u64::from(edge.clone()));
-                LittleEndian::write_f32(&mut mmap[offset+32..offset+36], *regret);
-                LittleEndian::write_f32(&mut mmap[offset+36..offset+40], f32::from(*policy));
+            for (edge, (policy, regret)) in edges_vec.iter() {
+                histories.push(u64::from(*bucket.history()) as i64);
+                presents.push(u64::from(*bucket.present()) as i64);
+                futures.push(u64::from(*bucket.futures()) as i64);
+                edges.push(u64::from(edge.clone()) as u32);
+                regrets.push(*regret);
+                policies.push(f32::from(*policy));
 
-                offset += MMAP_RECORD_SIZE;
                 written_records += 1;
 
                 if written_records % log_every_n == 0 || written_records == total_records {
                     let percentage = (written_records * 100) / total_records;
-                    log::info!("Saving blueprint progress: {}%", percentage);
+                    log::info!("Collecting blueprint data: {}%", percentage);
                 }
             }
         }
 
-        // Ensure data is flushed to disk
-        mmap.flush().expect("Failed to flush mmap");
-        log::info!("Completed saving {} records to {}", written_records, path_str);
+        // Create arrow arrays
+        let hist_array = Int64Array::from_slice(&histories);
+        let pres_array = Int64Array::from_slice(&presents);
+        let fut_array = Int64Array::from_slice(&futures);
+        let edge_array = UInt32Array::from_slice(&edges);
+        let regret_array = Float32Array::from_slice(&regrets);
+        let policy_array = Float32Array::from_slice(&policies);
+
+        let columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(hist_array),
+            Arc::new(pres_array),
+            Arc::new(fut_array),
+            Arc::new(edge_array),
+            Arc::new(regret_array),
+            Arc::new(policy_array),
+        ];
+
+        // Create schema
+        let schema = Schema::from(vec![
+            Field::new("history", DataType::Int64, false),
+            Field::new("present", DataType::Int64, false),
+            Field::new("futures", DataType::Int64, false),
+            Field::new("edge", DataType::UInt32, false),
+            Field::new("regret", DataType::Float32, false),
+            Field::new("policy", DataType::Float32, false),
+        ]);
+
+        // Define encodings
+        let encodings = vec![
+            vec![Encoding::Plain],      // history
+            vec![Encoding::Plain],      // present
+            vec![Encoding::Plain],      // futures
+            vec![Encoding::RleDictionary], // edge (low cardinality)
+            vec![Encoding::Plain],      // regret
+            vec![Encoding::Plain],      // policy
+        ];
+
+        // Write options
+        let options = WriteOptions {
+            write_statistics: true,
+            compression: CompressionOptions::Zstd(None),
+            version: Version::V2,
+            data_pagesize_limit: Some(512 * 1024), // 512KB pages
+        };
+
+        // Create chunk
+        let chunk = Chunk::new(columns);
+
+        // Create row group iterator
+        let row_groups = RowGroupIterator::try_new(
+            vec![Ok(chunk)].into_iter(),
+            &schema,
+            options,
+            encodings,
+        ).expect("Failed to create row group iterator");
+
+        // Write to file
+        let file = File::create(path).expect(&format!("Failed to create file at {}", path_str));
+        let writer_inner = BufWriter::new(file);
+        let mut writer = FileWriter::try_new(writer_inner, schema, options)
+            .expect("Failed to create parquet writer");
+
+        for group in row_groups {
+            writer.write(group.expect("Failed to get row group"))
+                .expect("Failed to write row group");
+        }
+
+        let _size = writer.end(None).expect("Failed to finalize parquet file");
+        log::info!("Completed saving {} records to parquet file", written_records);
     }
 
-        /// Load profile data using memory-mapped I/O.
-    /// Maps the file into memory and reads directly from the mapped region.
+    /// Load profile data from Apache Parquet format.
     #[cfg(feature = "native")]
-    pub fn load_mmap() -> Self {
-        use byteorder::{ByteOrder, LittleEndian};
+    pub fn load_parquet() -> Self {
         use crate::clustering::abstraction::Abstraction;
         use crate::gameplay::path::Path;
-        use std::fs::File;
         use crate::save::disk::Disk;
+        use std::fs::File;
+        use arrow2::io::parquet::read;
 
         let path_str = Self::path(Street::random());
         log::info!("{:<32}{:<32}", "loading     blueprint", path_str);
 
-        let file = File::open(&path_str).expect(&format!("Failed to open blueprint file: {}", path_str));
-        let mmap = unsafe { MmapOptions::new().map(&file).expect("Failed to mmap file") };
+        let mut file = File::open(&path_str).expect(&format!("Failed to open blueprint file: {}", path_str));
+        
+        // Read metadata
+        let metadata = read::read_metadata(&mut file).expect("Failed to read parquet metadata");
+        
+        // Infer schema
+        let schema = read::infer_schema(&metadata).expect("Failed to infer schema");
+        
+        log::info!("Loading blueprint from {} row groups", metadata.row_groups.len());
 
-        // Validate file size and read header
-        if mmap.len() < MMAP_HEADER_SIZE {
-            panic!("File too small to contain header: {} bytes", mmap.len());
-        }
-        let total_records = LittleEndian::read_u64(&mmap[0..MMAP_HEADER_SIZE]) as usize;
+        let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> = 
+            DashMap::with_hasher(FxBuildHasher::default());
 
-        let expected_size = MMAP_HEADER_SIZE + (total_records * MMAP_RECORD_SIZE);
-        if mmap.len() < expected_size {
-            panic!("File size mismatch: expected {} bytes, got {}", expected_size, mmap.len());
-        }
+        let mut total_records = 0;
 
-        log::info!("Loading {} records from memory-mapped file", total_records);
+        // Process each row group
+        for (rg_idx, row_group) in metadata.row_groups.iter().enumerate() {
+            // Create a file reader for this row group
+            let chunks = read::FileReader::new(
+                file.try_clone().expect("Failed to clone file handle"),
+                vec![row_group.clone()],
+                schema.clone(),
+                None,
+                None,
+                None,
+            );
 
-        // Pre-allocate with estimated capacity for better performance
-        let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> =
-            DashMap::with_capacity_and_hasher(total_records / 4, FxBuildHasher::default());
+            // Read the chunk
+            for chunk_result in chunks {
+                let chunk = chunk_result.expect("Failed to read chunk");
+                
+                // Get arrays from chunk
+                let arrays = chunk.arrays();
+                if arrays.len() != 6 {
+                    panic!("Expected 6 columns, got {}", arrays.len());
+                }
 
-        let log_every_n = (total_records / 100).max(1);
-        let mut records_processed = 0;
+                let histories = arrays[0].as_any().downcast_ref::<Int64Array>()
+                    .expect("Failed to cast history column");
+                let presents = arrays[1].as_any().downcast_ref::<Int64Array>()
+                    .expect("Failed to cast present column");
+                let futures = arrays[2].as_any().downcast_ref::<Int64Array>()
+                    .expect("Failed to cast futures column");
+                let edges = arrays[3].as_any().downcast_ref::<UInt32Array>()
+                    .expect("Failed to cast edge column");
+                let regrets = arrays[4].as_any().downcast_ref::<Float32Array>()
+                    .expect("Failed to cast regret column");
+                let policies = arrays[5].as_any().downcast_ref::<Float32Array>()
+                    .expect("Failed to cast policy column");
 
-        // Process records in chunks for better cache performance
-        for chunk_start in (0..total_records).step_by(CHUNK_SIZE) {
-            let chunk_end = (chunk_start + CHUNK_SIZE).min(total_records);
+                let num_rows = chunk.len();
 
-            for i in chunk_start..chunk_end {
-                let record_offset = MMAP_HEADER_SIZE + (i * MMAP_RECORD_SIZE);
+                // Process records
+                for i in 0..num_rows {
+                    let history = Path::from(histories.value(i) as u64);
+                    let present = Abstraction::from(presents.value(i) as u64);
+                    let futures = Path::from(futures.value(i) as u64);
+                    let edge = Edge::from(edges.value(i) as u64);
+                    let regret = regrets.value(i);
+                    let policy = policies.value(i);
 
-                // Read record directly from mapped memory: history(8) + present(8) + futures(8) + edge(8) + regret(4) + policy(4)
-                let history = Path::from(LittleEndian::read_u64(&mmap[record_offset..record_offset+8]));
-                let present = Abstraction::from(LittleEndian::read_u64(&mmap[record_offset+8..record_offset+16]));
-                let futures = Path::from(LittleEndian::read_u64(&mmap[record_offset+16..record_offset+24]));
-                let edge = Edge::from(LittleEndian::read_u64(&mmap[record_offset+24..record_offset+32]));
-                let regret_raw = LittleEndian::read_f32(&mmap[record_offset+32..record_offset+36]);
-                let policy_raw = LittleEndian::read_f32(&mmap[record_offset+36..record_offset+40]);
-                let regret = if regret_raw.is_finite() { regret_raw } else { 0.0 };
-                let policy = if policy_raw.is_finite() { policy_raw } else { 0.0 };
+                    let info = Info::from((history, present, futures));
+                    let bucket_mutex = encounters
+                        .entry(info)
+                        .or_insert_with(|| Mutex::new(SmallVec::new()));
+                    let mut bucket = bucket_mutex.lock();
+                    bucket.push((edge, (f16::from_f32(policy), regret)));
 
-                let info = Info::from((history, present, futures));
-                let bucket_mutex = encounters
-                    .entry(info)
-                    .or_insert_with(|| Mutex::new(SmallVec::new()));
-                let mut bucket = bucket_mutex.lock();
-                bucket.push((edge, (f16::from_f32(policy), regret)));
-
-                records_processed += 1;
+                    total_records += 1;
+                }
             }
 
-            if records_processed % log_every_n == 0 || records_processed == total_records {
-                let percentage = (records_processed * 100) / total_records;
-                log::info!("Loading blueprint progress: {}%", percentage);
-            }
+            log::info!("Loaded row group {} ({} rows)", rg_idx + 1, row_group.num_rows());
         }
 
-        log::info!("Loaded {} records from memory-mapped file", total_records);
+        log::info!("Loaded {} total records from parquet file", total_records);
 
         Self {
             encounters,
