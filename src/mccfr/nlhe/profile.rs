@@ -205,30 +205,18 @@ impl Profile {
             // Update regrets
             for (edge, delta) in regret_vec {
                 if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
-                    let current_regret = existing.1 .1;
-                    let new_regret = current_regret + delta;
+                    let new_regret = existing.1 .1 + delta;
                     
-                    // Check for NaN and clamp to bounds
+                    // Fast NaN check and clamp - only handle the problematic cases
                     if new_regret.is_nan() {
-                        log::warn!("NaN detected in regret update for edge {:?}: current={}, delta={}", edge, current_regret, delta);
                         existing.1 .1 = 0.0; // Reset to zero if NaN
-                    } else if !new_regret.is_finite() {
-                        log::warn!("Infinite value detected in regret update for edge {:?}: current={}, delta={}, new={}", edge, current_regret, delta, new_regret);
-                        existing.1 .1 = new_regret.signum() * crate::REGRET_MAX.min(crate::REGRET_MAX.abs());
                     } else {
                         existing.1 .1 = new_regret.clamp(crate::REGRET_MIN, crate::REGRET_MAX);
                     }
                 } else {
                     // Check delta for NaN before storing
-                    if delta.is_nan() {
-                        log::warn!("NaN delta in regret update for new edge {:?}", edge);
-                        bucket.push((edge, (f16::from_f32(0.0), 0.0)));
-                    } else if !delta.is_finite() {
-                        log::warn!("Infinite delta in regret update for new edge {:?}: {}", edge, delta);
-                        bucket.push((edge, (f16::from_f32(0.0), delta.signum() * crate::REGRET_MAX.min(crate::REGRET_MAX.abs()))));
-                    } else {
-                        bucket.push((edge, (f16::from_f32(0.0), delta.clamp(crate::REGRET_MIN, crate::REGRET_MAX))));
-                    }
+                    let safe_delta = if delta.is_nan() { 0.0 } else { delta.clamp(crate::REGRET_MIN, crate::REGRET_MAX) };
+                    bucket.push((edge, (f16::from_f32(0.0), safe_delta)));
                 }
             }
             // Update policies
@@ -237,24 +225,16 @@ impl Profile {
                     let prev = f32::from(existing.1 .0);
                     let new_policy = prev + delta;
                     
-                    // Check for NaN and clamp to valid probability range
-                    if new_policy.is_nan() {
-                        log::warn!("NaN detected in policy update for edge {:?}: prev={}, delta={}", edge, prev, delta);
-                        existing.1 .0 = f16::from_f32(crate::POLICY_MIN);
-                    } else if !new_policy.is_finite() || new_policy < 0.0 {
-                        log::warn!("Invalid policy value for edge {:?}: prev={}, delta={}, new={}", edge, prev, delta, new_policy);
+                    // Fast check for invalid values
+                    if new_policy.is_nan() || new_policy < 0.0 {
                         existing.1 .0 = f16::from_f32(crate::POLICY_MIN);
                     } else {
                         existing.1 .0 = f16::from_f32(new_policy);
                     }
                 } else {
                     // Check delta for validity before storing
-                    if delta.is_nan() || !delta.is_finite() || delta < 0.0 {
-                        log::warn!("Invalid policy delta for new edge {:?}: {}", edge, delta);
-                        bucket.push((edge, (f16::from_f32(crate::POLICY_MIN), 0.0)));
-                    } else {
-                        bucket.push((edge, (f16::from_f32(delta), 0.0)));
-                    }
+                    let safe_delta = if delta.is_nan() || delta < 0.0 { crate::POLICY_MIN } else { delta };
+                    bucket.push((edge, (f16::from_f32(safe_delta), 0.0)));
                 }
             }
         }
@@ -296,17 +276,6 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             bucket
                 .iter()
                 .find_map(|(e, (_, r))| if e == edge { Some(*r) } else { None })
-                .map(|r| {
-                    if r.is_nan() {
-                        log::warn!("NaN regret value found for edge {:?} in info {:?}, returning 0.0", edge, info);
-                        0.0
-                    } else if !r.is_finite() {
-                        log::warn!("Infinite regret value found for edge {:?} in info {:?}: {}, clamping", edge, info, r);
-                        r.signum() * crate::REGRET_MAX.min(crate::REGRET_MAX.abs())
-                    } else {
-                        r
-                    }
-                })
                 .unwrap_or_default()
         } else {
             0.0

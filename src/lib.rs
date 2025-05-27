@@ -44,11 +44,26 @@ const SINKHORN_ITERATIONS: usize = 128;
 const SINKHORN_TOLERANCE: Energy = 0.001;
 
 // kmeans clustering parameters
-const KMEANS_FLOP_TRAINING_ITERATIONS: usize = 20;
-const KMEANS_TURN_TRAINING_ITERATIONS: usize = 24;
-const KMEANS_FLOP_CLUSTER_COUNT: usize = 128;
-const KMEANS_TURN_CLUSTER_COUNT: usize = 144;
-const KMEANS_EQTY_CLUSTER_COUNT: usize = 101;
+#[cfg(not(feature = "shortdeck"))]
+mod kmeans_constants {
+    pub const KMEANS_FLOP_TRAINING_ITERATIONS: usize = 20;
+    pub const KMEANS_TURN_TRAINING_ITERATIONS: usize = 24;
+    pub const KMEANS_FLOP_CLUSTER_COUNT: usize = 128;
+    pub const KMEANS_TURN_CLUSTER_COUNT: usize = 144;
+    pub const KMEANS_EQTY_CLUSTER_COUNT: usize = 101;
+}
+
+#[cfg(feature = "shortdeck")]
+mod kmeans_constants {
+    pub const KMEANS_FLOP_TRAINING_ITERATIONS: usize = 10;
+    pub const KMEANS_TURN_TRAINING_ITERATIONS: usize = 12;
+    pub const KMEANS_FLOP_CLUSTER_COUNT: usize = 32;
+    pub const KMEANS_TURN_CLUSTER_COUNT: usize = 48;
+    pub const KMEANS_EQTY_CLUSTER_COUNT: usize = 51;
+}
+
+use kmeans_constants::*;
+
 
 /// rps mccfr parameteres
 const ASYMMETRIC_UTILITY: f32 = 2.0;
