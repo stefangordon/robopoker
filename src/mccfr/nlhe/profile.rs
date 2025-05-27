@@ -53,6 +53,12 @@ const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
 // reduces overhead. The majority of infosets have ≤4 edges.
 type Bucket = SmallVec<[(Edge, (f16, crate::Utility)); 4]>;
 
+#[inline(always)]
+fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
+    let val = val.max(min).min(max); // NaNs will propagate
+    if val.is_nan() { 0.0 } else { val }
+}
+
 pub struct Profile {
     pub(super) iterations: usize,
     pub(super) encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher>,
@@ -206,16 +212,11 @@ impl Profile {
             for (edge, delta) in regret_vec {
                 if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
                     let new_regret = existing.1 .1 + delta;
-                    
-                    // Fast NaN check and clamp - only handle the problematic cases
-                    if new_regret.is_nan() {
-                        existing.1 .1 = 0.0; // Reset to zero if NaN
-                    } else {
-                        existing.1 .1 = new_regret.clamp(crate::REGRET_MIN, crate::REGRET_MAX);
-                    }
+                    existing.1 .1 = self::safe_clamp(new_regret, crate::REGRET_MIN, crate::REGRET_MAX);
+
                 } else {
                     // Check delta for NaN before storing
-                    let safe_delta = if delta.is_nan() { 0.0 } else { delta.clamp(crate::REGRET_MIN, crate::REGRET_MAX) };
+                    let safe_delta = self::safe_clamp(delta, crate::REGRET_MIN, crate::REGRET_MAX) ;
                     bucket.push((edge, (f16::from_f32(0.0), safe_delta)));
                 }
             }
@@ -224,7 +225,7 @@ impl Profile {
                 if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
                     let prev = f32::from(existing.1 .0);
                     let new_policy = prev + delta;
-                    
+
                     // Fast check for invalid values
                     if new_policy.is_nan() || new_policy < 0.0 {
                         existing.1 .0 = f16::from_f32(crate::POLICY_MIN);
@@ -476,7 +477,7 @@ impl Profile {
             .sum();
 
                 log::info!("Saving blueprint to {} ({} records)", path_str, total_records);
-        
+
         let progress = crate::progress(total_records);
         progress.set_message("Saving blueprint to parquet");
 
@@ -503,7 +504,7 @@ impl Profile {
         // Write options - optimized for speed
         let options = WriteOptions {
             write_statistics: true, // Keep statistics for better query performance
-            compression: CompressionOptions::Lz4, // Much faster than zstd
+            compression: CompressionOptions::Zstd(Some(arrow2::io::parquet::write::ZstdLevel::try_new(1).unwrap())), // Fast ZSTD compression level 1
             version: Version::V2,
             data_pagesize_limit: Some(1024 * 1024), // Larger 1MB pages for better throughput
         };
@@ -654,12 +655,12 @@ impl Profile {
 
         let total_rows: usize = metadata.row_groups.iter().map(|rg| rg.num_rows() as usize).sum();
         log::info!("Loading blueprint from {} row groups ({} total rows)", metadata.row_groups.len(), total_rows);
-        
+
         let progress = crate::progress(total_rows);
         progress.set_message("Loading blueprint from parquet");
 
         let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> =
-            DashMap::with_capacity_and_hasher(total_rows / 4, FxBuildHasher::default()); // Pre-allocate capacity
+            DashMap::with_hasher(FxBuildHasher::default());
 
         let mut _total_records = 0;
 

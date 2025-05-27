@@ -170,7 +170,7 @@ impl Converter {
         }
 
         log::info!("Converting {} records from mmap to PostgreSQL format", total_records);
-        
+
         let progress = crate::progress(total_records);
         progress.set_message("Converting mmap to PostgreSQL");
 
@@ -306,7 +306,7 @@ impl Converter {
         }
 
         log::info!("Converting {} records from mmap to Parquet format", total_records);
-        
+
         let progress = crate::progress(total_records);
         progress.set_message("Converting mmap to parquet");
 
@@ -339,7 +339,7 @@ impl Converter {
         // Write options - optimized for speed
         let options = WriteOptions {
             write_statistics: true, // Keep statistics for better query performance
-            compression: CompressionOptions::Lz4, // Much faster than zstd
+            compression: CompressionOptions::Zstd(Some(arrow2::io::parquet::write::ZstdLevel::try_new(1).unwrap())), // Fast ZSTD compression level 1compression: CompressionOptions::Snappy, // Fast compression with good compatibility
             version: Version::V2,
             data_pagesize_limit: Some(1024 * 1024), // Larger 1MB pages for better throughput
         };
