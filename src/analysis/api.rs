@@ -814,12 +814,20 @@ use crate::gameplay::recall::Recall;
 // blueprint lookups
 impl API {
     pub async fn policy(&self, recall: Recall) -> Result<Vec<Decision>, E> {
+        self.policy_with_options(recall, false).await
+    }
+
+    pub async fn policy_with_options(&self, recall: Recall, disable_subgames: bool) -> Result<Vec<Decision>, E> {
         let game = recall.head();
         let street = game.street();
         let pot = game.pot();
 
-        // Check if we should solve a subgame for this situation
-        if self.should_solve_subgame(street, pot, Self::stack_to_pot_ratio(&game, recall.hero_position())) {
+        if disable_subgames {
+            log::debug!("Subgame solving disabled via query parameter, using blueprint only");
+        }
+
+        // Check if we should solve a subgame for this situation (unless disabled)
+        if !disable_subgames && self.should_solve_subgame(street, pot, Self::stack_to_pot_ratio(&game, recall.hero_position())) {
             // Attempt to get blueprint policy for warm-starting.
             let warm_start_strategy = self.blueprint_policy(&recall, true).await.unwrap_or(None);
             

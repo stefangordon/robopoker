@@ -2,6 +2,7 @@ use super::api::API;
 use super::request::AbsHist;
 use super::request::GetPolicy;
 use super::request::ObsHist;
+use super::request::PolicyQueryParams;
 use super::request::ReplaceAbs;
 use super::request::ReplaceAll;
 use super::request::ReplaceObs;
@@ -196,7 +197,11 @@ async fn hst_wrt_obs(api: web::Data<API>, req: web::Json<ObsHist>) -> impl Respo
     }
 }
 
-async fn lookup_policy(api: web::Data<API>, req: web::Json<GetPolicy>) -> impl Responder {
+async fn lookup_policy(
+    api: web::Data<API>, 
+    req: web::Json<GetPolicy>,
+    query: web::Query<PolicyQueryParams>
+) -> impl Responder {
     let hero = Turn::try_from(req.hero.as_str());
     let seen = Observation::try_from(req.seen.as_str());
     let path = req
@@ -204,9 +209,12 @@ async fn lookup_policy(api: web::Data<API>, req: web::Json<GetPolicy>) -> impl R
         .iter()
         .map(|s| Action::try_from(s.as_str()))
         .collect::<Result<Vec<_>, _>>();
+    
+    let disable_subgames = query.disable_subgames.unwrap_or(false);
+    
     match (hero, seen, path) {
         (Ok(hero), Ok(seen), Ok(path)) => {
-            match api.policy(Recall::from((hero, seen, path))).await {
+            match api.policy_with_options(Recall::from((hero, seen, path)), disable_subgames).await {
                 Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
                 Ok(rows) => HttpResponse::Ok().json(rows),
             }

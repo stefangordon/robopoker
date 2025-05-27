@@ -52,7 +52,17 @@ impl SubgameSolver {
         // Set the root info and seed warm-start if provided
         let root_info = self.encoder.seed(&self.root_game);
         if !self.warm_start.is_empty() {
-            self.profile.seed_decisions(&root_info, &self.warm_start);
+            // Translate blueprint strategy to subgame action space
+            let subgame_edges = root_info.choices();
+            let translated_strategy = self.translate_warm_start_to_subgame(&subgame_edges);
+
+            if !translated_strategy.is_empty() {
+                log::debug!("Translated warm start: {} blueprint actions -> {} subgame actions",
+                           self.warm_start.len(), translated_strategy.len());
+                self.profile.seed_decisions(&root_info, &translated_strategy);
+            } else {
+                log::warn!("Failed to translate warm start strategy to subgame action space");
+            }
         }
 
         let mut last_strategy = self.root_strategy(&root_info);
@@ -68,11 +78,11 @@ impl SubgameSolver {
         // Process iterations in chunks for better parallelization
         let chunk_size = 5;
         let mut i = 0;
+        let mut stable = 0u8;
 
         while i < self.iterations {
             let remaining = self.iterations - i;
             let current_chunk_size = chunk_size.min(remaining);
-            let mut stable = 0u8;
 
             // Process multiple iterations in parallel
             let all_updates: Vec<_> = (0..current_chunk_size)
@@ -110,6 +120,116 @@ impl SubgameSolver {
         }
 
         self.root_strategy(&root_info)
+    }
+
+    /// Translate warm start strategy from blueprint action space to subgame action space
+    fn translate_warm_start_to_subgame(&self, subgame_edges: &[Edge]) -> Vec<Decision> {
+        let mut translated = Vec::new();
+
+        // Log the original warm start strategy
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("Original warm start strategy ({} actions):", self.warm_start.len());
+            for (i, decision) in self.warm_start.iter().enumerate() {
+                log::debug!("  {}: edge={:?} weight={:.6}", i, decision.edge(), decision.weight());
+            }
+        }
+
+        // Group warm start decisions by action type
+        let mut check_weight = 0.0;
+        let mut fold_weight = 0.0;
+        let mut call_weight = 0.0;
+        let mut raise_weight = 0.0;
+        let mut shove_weight = 0.0;
+        let mut draw_weight = 0.0;
+
+        for decision in &self.warm_start {
+            match decision.edge() {
+                Edge::Check => check_weight += decision.weight(),
+                Edge::Fold => fold_weight += decision.weight(),
+                Edge::Call => call_weight += decision.weight(),
+                Edge::Raise(_) => raise_weight += decision.weight(), // Aggregate all raises
+                Edge::Shove => shove_weight += decision.weight(),
+                Edge::Draw => draw_weight += decision.weight(),
+            }
+        }
+
+        // Log aggregated weights by action type
+        log::debug!("Aggregated blueprint weights: Check={:.6} Fold={:.6} Call={:.6} Raise={:.6} Shove={:.6} Draw={:.6}",
+                   check_weight, fold_weight, call_weight, raise_weight, shove_weight, draw_weight);
+
+        // Count total raise edges in subgame
+        let raise_edge_count = subgame_edges.iter()
+            .filter(|e| matches!(e, Edge::Raise(_)))
+            .count() as f32;
+
+        log::debug!("Subgame has {} raise edges out of {} total edges", raise_edge_count, subgame_edges.len());
+
+        // Map to subgame edges
+        for &edge in subgame_edges {
+            let weight = match edge {
+                Edge::Check => check_weight,
+                Edge::Fold => fold_weight,
+                Edge::Call => call_weight,
+                Edge::Shove => shove_weight,
+                Edge::Draw => draw_weight,
+                Edge::Raise(odds) => {
+                    if raise_weight > 0.0 && raise_edge_count > 0.0 {
+                        // Distribute raise weight across all subgame raise sizes
+                        // Give more weight to middle-sized bets (around 0.75x to 1.5x pot)
+                        let pot_ratio = odds.0 as f32 / odds.1 as f32;
+                        let preference = if pot_ratio >= 0.5 && pot_ratio <= 2.0 {
+                            1.5 // Prefer reasonable bet sizes
+                        } else if pot_ratio >= 0.25 && pot_ratio <= 4.0 {
+                            1.0 // Normal weight for extreme sizes
+                        } else {
+                            0.5 // Lower weight for very extreme sizes
+                        };
+
+                        let distributed_weight = (raise_weight * preference) / raise_edge_count;
+                        log::debug!("  Raise {:?} (ratio={:.2}): preference={:.1} -> weight={:.6}",
+                                   odds, pot_ratio, preference, distributed_weight);
+                        distributed_weight
+                    } else {
+                        // Blueprint has no raises, give subgame raises small weight
+                        let total_non_raise_weight = check_weight + fold_weight + call_weight + shove_weight + draw_weight;
+                        if total_non_raise_weight > 0.0 && raise_edge_count > 0.0 {
+                            let fallback_weight = (total_non_raise_weight * 0.1) / raise_edge_count;
+                            log::debug!("  Raise {:?}: fallback weight={:.6}", odds, fallback_weight);
+                            fallback_weight
+                        } else {
+                            0.0
+                        }
+                    }
+                }
+            };
+
+            if weight > 0.0 {
+                translated.push(Decision::from((edge, weight)));
+            }
+        }
+
+        // Normalize weights to sum to 1.0
+        let total_weight: f32 = translated.iter().map(|d| d.weight()).sum();
+        log::debug!("Pre-normalization total weight: {:.6}", total_weight);
+
+        if total_weight > 0.0 {
+            let normalized = translated.into_iter().map(|d| {
+                Decision::from((d.edge(), d.weight() / total_weight))
+            }).collect::<Vec<_>>();
+
+            // Log final translated strategy
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!("Final translated strategy ({} actions):", normalized.len());
+                for (i, decision) in normalized.iter().enumerate() {
+                    log::debug!("  {}: edge={:?} weight={:.6}", i, decision.edge(), decision.weight());
+                }
+            }
+
+            normalized
+        } else {
+            log::warn!("Translation resulted in zero total weight!");
+            Vec::new()
+        }
     }
 
     /// Generate a batch of counterfactual updates
@@ -188,7 +308,7 @@ impl SubgameSolver {
             max_diff = max_diff.max((o.weight() - n.weight()).abs());
         }
 
-        const MAX_EPS: f32 = 1e-3;   // 0.1 %
+        const MAX_EPS: f32 = 0.005;   // 0.1 %
 
         if max_diff < MAX_EPS {
             *stable += 1;            // one more stable check

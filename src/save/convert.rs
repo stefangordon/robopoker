@@ -170,6 +170,9 @@ impl Converter {
         }
 
         log::info!("Converting {} records from mmap to PostgreSQL format", total_records);
+        
+        let progress = crate::progress(total_records);
+        progress.set_message("Converting mmap to PostgreSQL");
 
         // Determine output path - use pgcopy directory for PostgreSQL format
         let current_dir = std::env::current_dir().unwrap_or_default();
@@ -188,8 +191,6 @@ impl Converter {
         Self::write_pg_header(&mut encoder);
 
                                 // Process records in chunks
-        let mut records_processed = 0;
-
         for chunk_start in (0..total_records).step_by(CHUNK_SIZE) {
             let chunk_end = (chunk_start + CHUNK_SIZE).min(total_records);
 
@@ -207,12 +208,8 @@ impl Converter {
                 // Write PostgreSQL record (big-endian format)
                 Self::write_pg_record(&mut encoder, history, present, futures, edge, regret, policy);
 
-                records_processed += 1;
+                progress.inc(1);
             }
-
-            // Log progress every chunk
-            let percentage = (records_processed * 100) / total_records;
-            log::info!("Conversion progress: {}% ({} / {} records)", percentage, records_processed, total_records);
         }
 
         // Write PostgreSQL binary trailer
@@ -222,7 +219,7 @@ impl Converter {
         encoder.finish()
             .expect("Failed to finalize zstd compression");
 
-        log::info!("Successfully converted {} records to {}", records_processed, output_path.display());
+        progress.finish_with_message("Conversion complete");
     }
 
         /// Write PostgreSQL binary COPY header
@@ -309,6 +306,9 @@ impl Converter {
         }
 
         log::info!("Converting {} records from mmap to Parquet format", total_records);
+        
+        let progress = crate::progress(total_records);
+        progress.set_message("Converting mmap to parquet");
 
         // Determine output path - use pgcopy directory
         let current_dir = std::env::current_dir().unwrap_or_default();
@@ -353,7 +353,6 @@ impl Converter {
 
         // Process records in chunks to avoid loading everything into memory
         const RECORDS_PER_CHUNK: usize = 1_000_000; // Process 1M records at a time for better performance
-        let mut records_processed = 0;
 
         for chunk_start in (0..total_records).step_by(RECORDS_PER_CHUNK) {
             let chunk_end = (chunk_start + RECORDS_PER_CHUNK).min(total_records);
@@ -387,7 +386,7 @@ impl Converter {
                 regrets.push(regret);
                 policies.push(policy);
 
-                records_processed += 1;
+                progress.inc(1);
             }
 
             // Create arrow arrays for this chunk
@@ -422,18 +421,11 @@ impl Converter {
                     .expect("Failed to write row group");
             }
 
-            // Log progress less frequently for large datasets
-            let log_every_chunk = if total_records > 100_000_000 { 10 } else { 1 }; // Every 10th chunk for large datasets
-            let chunk_number = (chunk_start / RECORDS_PER_CHUNK) + 1; // Use chunk_start for correct chunk number
-            if chunk_number % log_every_chunk == 0 || records_processed == total_records {
-                let percentage = (records_processed * 100) / total_records;
-                log::info!("Conversion progress: {}% ({} / {} records)", percentage, records_processed, total_records);
-            }
         }
 
         // Finalize the parquet file
         let _size = writer.end(None).expect("Failed to finalize parquet file");
-        log::info!("Successfully converted {} records to {}", records_processed, output_path.display());
+        progress.finish_with_message("Conversion complete");
     }
 
     /// Convert blueprint file to Parquet format

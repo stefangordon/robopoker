@@ -370,8 +370,18 @@ pub trait Profile {
 
         // Prevent numeric overflow that can create ±Inf and later NaNs
         let mut result = reach * payoff / sampling;
+        
+        // Additional safety check for extreme values before they become infinite
+        if result.abs() > crate::REGRET_MAX {
+            log::debug!("relative_value clamped: reach={}, payoff={}, sampling={}, result={}", 
+                       reach, payoff, sampling, result);
+            result = result.signum() * crate::REGRET_MAX;
+        }
+        
         if !result.is_finite() {
             // Clamp to REGRET_MAX with correct sign to keep training stable
+            log::warn!("relative_value produced non-finite value: reach={}, payoff={}, sampling={}", 
+                      reach, payoff, sampling);
             result = result.signum() * crate::REGRET_MAX;
         }
 

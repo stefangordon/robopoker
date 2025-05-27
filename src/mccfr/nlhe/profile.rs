@@ -205,18 +205,56 @@ impl Profile {
             // Update regrets
             for (edge, delta) in regret_vec {
                 if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
-                    existing.1 .1 += delta; // add to regret part
+                    let current_regret = existing.1 .1;
+                    let new_regret = current_regret + delta;
+                    
+                    // Check for NaN and clamp to bounds
+                    if new_regret.is_nan() {
+                        log::warn!("NaN detected in regret update for edge {:?}: current={}, delta={}", edge, current_regret, delta);
+                        existing.1 .1 = 0.0; // Reset to zero if NaN
+                    } else if !new_regret.is_finite() {
+                        log::warn!("Infinite value detected in regret update for edge {:?}: current={}, delta={}, new={}", edge, current_regret, delta, new_regret);
+                        existing.1 .1 = new_regret.signum() * crate::REGRET_MAX.min(crate::REGRET_MAX.abs());
+                    } else {
+                        existing.1 .1 = new_regret.clamp(crate::REGRET_MIN, crate::REGRET_MAX);
+                    }
                 } else {
-                    bucket.push((edge, (f16::from_f32(0.0), delta)));
+                    // Check delta for NaN before storing
+                    if delta.is_nan() {
+                        log::warn!("NaN delta in regret update for new edge {:?}", edge);
+                        bucket.push((edge, (f16::from_f32(0.0), 0.0)));
+                    } else if !delta.is_finite() {
+                        log::warn!("Infinite delta in regret update for new edge {:?}: {}", edge, delta);
+                        bucket.push((edge, (f16::from_f32(0.0), delta.signum() * crate::REGRET_MAX.min(crate::REGRET_MAX.abs()))));
+                    } else {
+                        bucket.push((edge, (f16::from_f32(0.0), delta.clamp(crate::REGRET_MIN, crate::REGRET_MAX))));
+                    }
                 }
             }
             // Update policies
             for (edge, delta) in policy_vec {
                 if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
                     let prev = f32::from(existing.1 .0);
-                    existing.1 .0 = f16::from_f32(prev + delta);
+                    let new_policy = prev + delta;
+                    
+                    // Check for NaN and clamp to valid probability range
+                    if new_policy.is_nan() {
+                        log::warn!("NaN detected in policy update for edge {:?}: prev={}, delta={}", edge, prev, delta);
+                        existing.1 .0 = f16::from_f32(crate::POLICY_MIN);
+                    } else if !new_policy.is_finite() || new_policy < 0.0 {
+                        log::warn!("Invalid policy value for edge {:?}: prev={}, delta={}, new={}", edge, prev, delta, new_policy);
+                        existing.1 .0 = f16::from_f32(crate::POLICY_MIN);
+                    } else {
+                        existing.1 .0 = f16::from_f32(new_policy);
+                    }
                 } else {
-                    bucket.push((edge, (f16::from_f32(delta), 0.0)));
+                    // Check delta for validity before storing
+                    if delta.is_nan() || !delta.is_finite() || delta < 0.0 {
+                        log::warn!("Invalid policy delta for new edge {:?}: {}", edge, delta);
+                        bucket.push((edge, (f16::from_f32(crate::POLICY_MIN), 0.0)));
+                    } else {
+                        bucket.push((edge, (f16::from_f32(delta), 0.0)));
+                    }
                 }
             }
         }
@@ -258,6 +296,17 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             bucket
                 .iter()
                 .find_map(|(e, (_, r))| if e == edge { Some(*r) } else { None })
+                .map(|r| {
+                    if r.is_nan() {
+                        log::warn!("NaN regret value found for edge {:?} in info {:?}, returning 0.0", edge, info);
+                        0.0
+                    } else if !r.is_finite() {
+                        log::warn!("Infinite regret value found for edge {:?} in info {:?}: {}, clamping", edge, info, r);
+                        r.signum() * crate::REGRET_MAX.min(crate::REGRET_MAX.abs())
+                    } else {
+                        r
+                    }
+                })
                 .unwrap_or_default()
         } else {
             0.0
@@ -458,6 +507,9 @@ impl Profile {
             .sum();
 
                 log::info!("Saving blueprint to {} ({} records)", path_str, total_records);
+        
+        let progress = crate::progress(total_records);
+        progress.set_message("Saving blueprint to parquet");
 
         // Create schema
         let schema = Schema::from(vec![
@@ -495,8 +547,7 @@ impl Profile {
 
         // Stream data in chunks to avoid doubling memory usage
         const RECORDS_PER_CHUNK: usize = 1_000_000; // Process 1M records at a time
-        let mut written_records = 0;
-        let log_every_n = (total_records / 20).max(10_000_000); // Log every 5% or 10M records, whichever is larger
+        let mut _written_records = 0;
 
         let mut chunk_histories = Vec::with_capacity(RECORDS_PER_CHUNK);
         let mut chunk_presents = Vec::with_capacity(RECORDS_PER_CHUNK);
@@ -517,7 +568,8 @@ impl Profile {
                 chunk_regrets.push(*regret);
                 chunk_policies.push(f32::from(*policy));
 
-                written_records += 1;
+                _written_records += 1;
+                progress.inc(1);
 
                 // Write chunk when it's full
                 if chunk_histories.len() >= RECORDS_PER_CHUNK {
@@ -542,11 +594,6 @@ impl Profile {
                     chunk_regrets.clear();
                     chunk_policies.clear();
                 }
-
-                if written_records % log_every_n == 0 {
-                    let percentage = (written_records * 100) / total_records;
-                    log::info!("Streaming blueprint data: {}% ({} records)", percentage, written_records);
-                }
             }
         }
 
@@ -567,11 +614,7 @@ impl Profile {
         }
 
         let _size = writer.end(None).expect("Failed to finalize parquet file");
-        log::info!("Completed streaming {} records to parquet file", written_records);
-        
-        // Final progress log
-        let percentage = (written_records * 100) / total_records;
-        log::info!("Final: {}% ({} / {} records)", percentage, written_records, total_records);
+        progress.finish_with_message("Blueprint saved to parquet");
     }
 
     /// Helper function to write a chunk of data to the parquet file
@@ -642,15 +685,17 @@ impl Profile {
 
         let total_rows: usize = metadata.row_groups.iter().map(|rg| rg.num_rows() as usize).sum();
         log::info!("Loading blueprint from {} row groups ({} total rows)", metadata.row_groups.len(), total_rows);
+        
+        let progress = crate::progress(total_rows);
+        progress.set_message("Loading blueprint from parquet");
 
         let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> =
             DashMap::with_capacity_and_hasher(total_rows / 4, FxBuildHasher::default()); // Pre-allocate capacity
 
-        let mut total_records = 0;
-        let log_every_n = (total_rows / 20).max(10_000_000); // Log every 5% or 10M records, whichever is larger
+        let mut _total_records = 0;
 
         // Process each row group
-        for (rg_idx, row_group) in metadata.row_groups.iter().enumerate() {
+        for (_rg_idx, row_group) in metadata.row_groups.iter().enumerate() {
             // Create a file reader for this row group
             let chunks = FileReader::new(
                 file.try_clone().expect("Failed to clone file handle"),
@@ -702,23 +747,13 @@ impl Profile {
                     let mut bucket = bucket_mutex.lock();
                     bucket.push((edge, (f16::from_f32(policy), regret)));
 
-                    total_records += 1;
-
-                    // Log progress less frequently for large datasets
-                    if total_records % log_every_n == 0 {
-                        let percentage = (total_records * 100) / total_rows;
-                        log::info!("Loading blueprint data: {}% ({} records)", percentage, total_records);
-                    }
+                    _total_records += 1;
+                    progress.inc(1);
                 }
-            }
-
-            // Only log row group completion for smaller datasets or every 10th row group
-            if total_rows < 100_000_000 || (rg_idx + 1) % 10 == 0 || rg_idx + 1 == metadata.row_groups.len() {
-                log::info!("Loaded row group {} of {} ({} rows)", rg_idx + 1, metadata.row_groups.len(), row_group.num_rows());
             }
         }
 
-        log::info!("Loaded {} total records from parquet file", total_records);
+        progress.finish_with_message("Blueprint loaded from parquet");
 
         Self {
             encounters,

@@ -54,3 +54,9 @@ pub struct GetPolicy {
     pub seen: String,
     pub path: Vec<String>,
 }
+
+#[derive(Deserialize)]
+pub struct PolicyQueryParams {
+    #[serde(rename = "disable-subgames")]
+    pub disable_subgames: Option<bool>,
+}
