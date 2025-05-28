@@ -62,6 +62,7 @@ harness = false
 [features]
 default = ["native"]
 shortdeck = []
+subgame = ["native"]
 native = [
     "colored",
     "dialoguer",
@@ -81,6 +82,7 @@ native = [
 [[bin]]
 name = "analysis_cli"
 path = "src/analysis_cli.rs"
+required-features = ["subgame"]
 
 [profile.release]
 debug = true

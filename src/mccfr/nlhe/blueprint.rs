@@ -10,7 +10,7 @@ impl Blueprint for super::solver::NLHE {
     type G = super::game::Game;
     type I = super::info::Info;
     type P = super::profile::Profile;
-    type S = super::encoder::Encoder;
+    type S = super::encoder::BlueprintEncoder;
 
     fn train() {
         use crate::cards::street::Street;

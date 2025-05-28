@@ -5,6 +5,7 @@ use super::turn::Turn;
 use crate::mccfr::structs::node::Node;
 use crate::mccfr::structs::tree::Tree;
 use crate::mccfr::types::branch::Branch;
+use crate::mccfr::nlhe::encoder::BetSizer;
 
 /// infoset encoding is fully abstracted. it must be implemented
 /// by the consumer of this MCCFR API.
@@ -22,6 +23,7 @@ pub trait Encoder {
     type E: Edge;
     type G: Game<E = Self::E, T = Self::T>;
     type I: Info<E = Self::E, T = Self::T>;
+    type S: BetSizer;
 
     fn seed(&self, game: &Self::G) -> Self::I;
     fn info(

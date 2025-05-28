@@ -53,7 +53,7 @@ pub struct Encoder<S: BetSizer = BlueprintSizer> {
 
 impl<S: BetSizer> Encoder<S> {
     fn name() -> String {
-        "isomorphism".to_string()
+        format!("isomorphism_{}", std::any::type_name::<S>())
     }
 
     pub fn abstraction(&self, iso: &Isomorphism) -> Abstraction {
@@ -114,6 +114,7 @@ impl<S: BetSizer> crate::mccfr::traits::encoder::Encoder for Encoder<S> {
     type E = Edge;
     type G = Game;
     type I = Info;
+    type S = S;
 
     fn seed(&self, root: &Self::G) -> Self::I {
         let ref iso = Isomorphism::from(root.sweat());
@@ -123,6 +124,7 @@ impl<S: BetSizer> crate::mccfr::traits::encoder::Encoder for Encoder<S> {
         let futures = Path::from(Self::choices(root, depth));
         Self::I::from((history, present, futures))
     }
+
     fn info(&self, tree: &Tree, leaf: Branch<Self::E, Self::G>) -> Self::I {
         let (edge, ref game, head) = leaf;
         let ref iso = Isomorphism::from(game.sweat());

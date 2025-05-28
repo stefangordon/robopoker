@@ -8,6 +8,7 @@ use zstd::stream::Decoder as ZDecoder;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use crate::mccfr::types::policy::Policy;
+use crate::mccfr::types::decision::Decision;
 use crate::mccfr::traits::info::Info as InfoTrait;
 use smallvec::SmallVec;
 use std::path::PathBuf;
@@ -28,7 +29,6 @@ use arrow2::{
     },
 };
 use std::sync::Arc;
-use crate::analysis::response::Decision;
 
 // File format constants and specifications
 //

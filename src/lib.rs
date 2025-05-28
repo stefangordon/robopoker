@@ -1,4 +1,4 @@
-#[cfg(feature = "native")]
+#[cfg(all(feature = "native", feature = "subgame"))]
 pub mod analysis;
 #[cfg(feature = "native")]
 pub mod players;
@@ -12,6 +12,12 @@ pub mod mccfr;
 pub mod search;
 pub mod transport;
 pub mod wasm;
+
+#[cfg(feature = "subgame")]
+pub mod subgame;
+
+#[cfg(feature = "subgame")]
+pub use analysis::Server;
 
 pub use cards::*;
 pub use gameplay::*;
@@ -75,7 +81,7 @@ const CFR_TREE_COUNT_RPS: usize = 8192;
 pub const CHECKPOINT_HOURS: u64 = 6;
 
 // nlhe mccfr parameters
-const CFR_BATCH_SIZE_NLHE: usize = 128;
+const CFR_BATCH_SIZE_NLHE: usize = 1024;
 const CFR_TREE_COUNT_NLHE: usize = 0x1000000;
 
 /// profile average sampling parameters
@@ -104,6 +110,7 @@ pub struct Args {
     pub publish: bool,
     /// Run the analysis server
     #[arg(long)]
+    #[cfg(feature = "subgame")]
     pub analyze: bool,
     /// Run exploitability evaluation
     #[arg(long)]

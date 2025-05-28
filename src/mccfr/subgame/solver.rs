@@ -1,6 +1,6 @@
 use super::{Edge, Game, Info, Turn};
 use super::{SUBGAME_MIN_ITERATIONS, SUBGAME_MAX_ITERATIONS};
-use crate::analysis::response::Decision;
+use crate::mccfr::types::decision::Decision;
 use crate::cards::isomorphism::Isomorphism;
 use crate::clustering::abstraction::Abstraction;
 use crate::mccfr::structs::tree::Tree;

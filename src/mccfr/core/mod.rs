@@ -1,4 +1,4 @@
-use crate::analysis::response::Decision;
+use crate::mccfr::types::decision::Decision;
 use crate::mccfr::traits::{encoder::Encoder as EncoderTrait, profile::Profile as ProfileTrait};
 
 /// Trait for plug-in convergence checking policies.
@@ -23,6 +23,8 @@ impl ConvergenceRule for NeverConverge {
 pub struct DeltaThreshold {
     pub eps: f32,
 }
+
+
 impl ConvergenceRule for DeltaThreshold {
     fn has_converged(&mut self, old: &[Decision], new: &[Decision]) -> bool {
         if old.len() != new.len() {
@@ -68,4 +70,4 @@ where
     }
 
     // --- helper methods will be re-added when the driver integration is completed ---
-} 
+}

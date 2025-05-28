@@ -15,6 +15,7 @@ async fn main() {
     if arguments.publish {
         crate::save::Writer::publish().await.unwrap();
     }
+    #[cfg(feature = "subgame")]
     if arguments.analyze {
         crate::analysis::Server::run().await.unwrap();
     }

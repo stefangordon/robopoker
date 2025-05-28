@@ -22,6 +22,8 @@ use crate::mccfr::nlhe::encoder::BlueprintEncoder;
 use crate::mccfr::nlhe::encoder::Encoder as NLHEEncoder;
 use crate::mccfr::subgame::SubgameSizer;
 use crate::save::disk::Disk;
+use crate::mccfr::types::decision::Decision;
+use crate::gameplay::recall::Recall;
 
 pub struct API {
     client: Arc<Client>,
@@ -807,9 +809,6 @@ impl API {
         Ok(rows.into_iter().map(Sample::from).collect())
     }
 }
-
-use crate::analysis::response::Decision;
-use crate::gameplay::recall::Recall;
 
 // blueprint lookups
 impl API {

@@ -29,12 +29,14 @@
 //! let strategy = solver.solve().await;
 //! ```
 
+#[cfg(feature = "subgame")]
 mod solver;
 
+#[cfg(feature = "subgame")]
 pub use solver::{SubgameSolver, SubgameSolverBuilder};
 
 // Re-export types needed by subgame solving
-use crate::mccfr::nlhe::{Edge, Game, Info, Turn};
+use crate::mccfr::nlhe::{Game};
 use crate::gameplay::odds::Odds;
 
 // Internal use only

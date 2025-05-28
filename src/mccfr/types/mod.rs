@@ -7,4 +7,5 @@
 
 pub mod branch;
 pub mod counterfactual;
+pub mod decision;
 pub mod policy;

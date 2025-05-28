@@ -1,9 +1,11 @@
-use super::encoder::Encoder;
 use super::profile::Profile;
 use crate::cards::street::Street;
 use crate::save::disk::Disk;
 use crate::Arbitrary;
-use crate::mccfr::nlhe::encoder::BlueprintEncoder;
+use crate::mccfr::nlhe::encoder::{BlueprintEncoder, BlueprintSizer};
+use crate::mccfr::nlhe::{Edge, Game, Info, Turn};
+use crate::mccfr::structs::tree::Tree;
+use crate::mccfr::types::branch::Branch;
 
 /// NLHE represents the complete Monte Carlo Counterfactual Regret Minimization (MCCFR) algorithm
 /// for No-Limit Hold'em poker. It combines:
@@ -19,8 +21,24 @@ use crate::mccfr::nlhe::encoder::BlueprintEncoder;
 /// The training process uses external sampling MCCFR with alternating updates and
 /// linear averaging of strategies over time.
 pub struct NLHE {
-    pub(super) sampler: Encoder,
+    pub(super) sampler: BlueprintEncoder,
     pub(super) profile: Profile,
+}
+
+impl crate::mccfr::traits::encoder::Encoder for NLHE {
+    type T = Turn;
+    type E = Edge;
+    type G = Game;
+    type I = Info;
+    type S = BlueprintSizer;
+
+    fn seed(&self, root: &Self::G) -> Self::I {
+        self.sampler.seed(root)
+    }
+
+    fn info(&self, tree: &Tree<Self::T, Self::E, Self::G, Self::I>, leaf: Branch<Self::E, Self::G>) -> Self::I {
+        self.sampler.info(tree, leaf)
+    }
 }
 
 #[cfg(feature = "native")]
@@ -37,13 +55,13 @@ impl Disk for NLHE {
     fn grow(_: Street) -> Self {
         Self {
             profile: Profile::default(),
-            sampler: Encoder::load(Street::random()),
+            sampler: BlueprintEncoder::load(Street::random()),
         }
     }
     fn load(_: Street) -> Self {
         Self {
             profile: Profile::load(Street::random()),
-            sampler: Encoder::load(Street::random()),
+            sampler: BlueprintEncoder::load(Street::random()),
         }
     }
 }
