@@ -396,7 +396,9 @@ impl crate::save::disk::Disk for Profile {
 
         path.to_string_lossy().into_owned()
     }
-
+    fn done(_: Street) -> bool {
+        std::fs::metadata(Self::path(Street::random())).is_ok()
+    }
     fn load(_: Street) -> Self {
         use std::fs::File;
         use std::io::Read;

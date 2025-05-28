@@ -207,7 +207,21 @@ impl<S: BetSizer> crate::save::upload::Table for Encoder<S> {
 
 impl<S: BetSizer> crate::save::disk::Disk for Encoder<S> {
     fn name() -> String {
-        Self::name()
+        "isomorphism".to_string()
+    }
+    fn path(street: Street) -> String {
+        format!(
+            "{}/pgcopy/isomorphism.{}",
+            std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            street
+        )
+    }
+    fn done(street: Street) -> bool {
+        let path = Self::path(street);
+        std::fs::metadata(path).is_ok()
     }
     fn save(&self) {
         unimplemented!("saving happens at Lookup level. composed of 4 street-level Lookup saves")
