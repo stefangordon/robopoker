@@ -665,6 +665,9 @@ impl Profile {
         use crate::gameplay::path::Path;
         use crate::save::disk::Disk;
         use std::fs::File;
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         let path_str = Self::path(Street::random());
         log::info!("{:<32}{:<32}", "loading     blueprint", path_str);
@@ -686,66 +689,81 @@ impl Profile {
         let encounters: DashMap<Info, RwLock<Bucket>, FxBuildHasher> =
             DashMap::with_hasher(FxBuildHasher::default());
 
-        let mut _total_records = 0;
+        // Atomic row counter for optional logging/debugging
+        let processed_rows = AtomicUsize::new(0);
 
-        // Process each row group
-        for (_rg_idx, row_group) in metadata.row_groups.iter().enumerate() {
-            // Create a file reader for this row group
-            let chunks = FileReader::new(
-                file.try_clone().expect("Failed to clone file handle"),
-                vec![row_group.clone()],
-                schema.clone(),
-                None,
-                None,
-                None,
-            );
+        // Share path so each thread can reopen the file independently
+        let path_shared = Arc::new(path_str.clone());
 
-            // Read the chunk
-            for chunk_result in chunks {
-                let chunk = chunk_result.expect("Failed to read chunk");
+        // Build a dedicated 8-thread pool for loading
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .expect("Failed to build rayon pool")
+            .install(|| {
+                metadata
+                    .row_groups
+                    .par_iter()
+                    .enumerate()
+                    .for_each(|(_rg_idx, row_group)| {
+                        // Open a fresh handle for this row-group
+                        let file_handle = std::fs::File::open(&*path_shared)
+                            .expect("Failed to reopen parquet file");
 
-                // Get arrays from chunk
-                let arrays = chunk.arrays();
-                if arrays.len() != 6 {
-                    panic!("Expected 6 columns, got {}", arrays.len());
-                }
+                        let chunks = FileReader::new(
+                            file_handle,
+                            vec![row_group.clone()],
+                            schema.clone(),
+                            None,
+                            None,
+                            None,
+                        );
 
-                let histories = arrays[0].as_any().downcast_ref::<Int64Array>()
-                    .expect("Failed to cast history column");
-                let presents = arrays[1].as_any().downcast_ref::<Int64Array>()
-                    .expect("Failed to cast present column");
-                let futures = arrays[2].as_any().downcast_ref::<Int64Array>()
-                    .expect("Failed to cast futures column");
-                let edges = arrays[3].as_any().downcast_ref::<UInt32Array>()
-                    .expect("Failed to cast edge column");
-                let regrets = arrays[4].as_any().downcast_ref::<Float32Array>()
-                    .expect("Failed to cast regret column");
-                let policies = arrays[5].as_any().downcast_ref::<Float32Array>()
-                    .expect("Failed to cast policy column");
+                        for chunk_result in chunks {
+                            let chunk = chunk_result.expect("Failed to read chunk");
 
-                let num_rows = chunk.len();
+                            // Column arrays
+                            let arrays = chunk.arrays();
+                            debug_assert_eq!(arrays.len(), 6, "Unexpected column count");
 
-                // Process records
-                for i in 0..num_rows {
-                    let history = Path::from(histories.value(i) as u64);
-                    let present = Abstraction::from(presents.value(i) as u64);
-                    let futures = Path::from(futures.value(i) as u64);
-                    let edge = Edge::from(edges.value(i) as u64);
-                    let regret = regrets.value(i);
-                    let policy = policies.value(i);
+                            let histories = arrays[0].as_any().downcast_ref::<Int64Array>()
+                                .expect("history col");
+                            let presents = arrays[1].as_any().downcast_ref::<Int64Array>()
+                                .expect("present col");
+                            let futures = arrays[2].as_any().downcast_ref::<Int64Array>()
+                                .expect("futures col");
+                            let edges = arrays[3].as_any().downcast_ref::<UInt32Array>()
+                                .expect("edge col");
+                            let regrets = arrays[4].as_any().downcast_ref::<Float32Array>()
+                                .expect("regret col");
+                            let policies = arrays[5].as_any().downcast_ref::<Float32Array>()
+                                .expect("policy col");
 
-                    let info = Info::from((history, present, futures));
-                    let bucket_mutex = encounters
-                        .entry(info)
-                        .or_insert_with(|| RwLock::new(SmallVec::new()));
-                    let mut bucket = bucket_mutex.value().write();
-                    bucket.push((u8::from(edge), (f16::from_f32(policy), regret)));
+                            let num_rows = chunk.len();
 
-                    _total_records += 1;
-                    progress.inc(1);
-                }
-            }
-        }
+                            for i in 0..num_rows {
+                                let history = Path::from(histories.value(i) as u64);
+                                let present = Abstraction::from(presents.value(i) as u64);
+                                let futures = Path::from(futures.value(i) as u64);
+                                let edge = Edge::from(edges.value(i) as u64);
+                                let regret = regrets.value(i);
+                                let policy = policies.value(i);
+
+                                let info = Info::from((history, present, futures));
+                                let bucket_mutex = encounters
+                                    .entry(info)
+                                    .or_insert_with(|| RwLock::new(SmallVec::new()));
+                                bucket_mutex
+                                    .value()
+                                    .write()
+                                    .push((u8::from(edge), (f16::from_f32(policy), regret)));
+
+                                processed_rows.fetch_add(1, Ordering::Relaxed);
+                                progress.inc(1);
+                            }
+                        }
+                    });
+            });
 
         progress.finish_with_message("Blueprint loaded from parquet");
 
