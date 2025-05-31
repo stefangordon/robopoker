@@ -124,6 +124,7 @@ impl Blueprint for super::solver::NLHE {
                 // Flush each local map into the global profile in parallel
                 .for_each(|local| {
                     for ((info, edge), (delta_p, delta_r)) in local.into_iter() {
+                        let edge_key = u8::from(edge);
                         // Access the bucket-level map via DashMap + Mutex
                         let bucket_mutex = profile_ref
                             .encounters
@@ -133,7 +134,7 @@ impl Blueprint for super::solver::NLHE {
                         let mut bucket = bucket_mutex.value().write();
 
                         // Search for edge record
-                        if let Some((_, entry)) = bucket.iter_mut().find(|(e, _)| *e == edge) {
+                        if let Some((_, entry)) = bucket.iter_mut().find(|(e, _)| *e == edge_key) {
                             // Current values
                             let current_policy = f32::from(entry.0);
                             let current_regret = entry.1;
@@ -160,12 +161,12 @@ impl Blueprint for super::solver::NLHE {
                             let new_policy = (0.0 * discount_none + delta_p).max(crate::POLICY_MIN);
                             #[cfg(debug_assertions)]
                             debug_assert!(
-                                bucket.iter().all(|(e, _)| *e != edge),
+                                bucket.iter().all(|(e, _)| *e != edge_key),
                                 "duplicate edge {:?} detected in infoset {:?}",
                                 edge,
                                 info
                             );
-                            bucket.push((edge, (f16::from_f32(new_policy), new_regret)));
+                            bucket.push((edge_key, (f16::from_f32(new_policy), new_regret)));
                         }
                     }
                 });

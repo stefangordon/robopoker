@@ -49,9 +49,9 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const PGCOPY_RECORD_SIZE: usize = 66; // 2-byte header already consumed + 64 payload
 const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
 
-// Using SmallVec (inline capacity 4) instead of a per-infoset HashMap dramatically
-// reduces overhead. The majority of infosets have ≤4 edges.
-type Bucket = SmallVec<[(Edge, (f16, crate::Utility)); 4]>;
+// Store Edge as compact u8 key inside buckets to reduce memory footprint
+// The Edge <-> u8 bijection is already implemented via From conversions.
+type Bucket = SmallVec<[(u8, (f16, crate::Utility)); 4]>;
 
 #[inline(always)]
 fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
@@ -200,7 +200,7 @@ impl Profile {
         let total = total.max(crate::POLICY_MIN);
         for d in decisions {
             let w = d.weight() / total;
-            bucket.push((d.edge(), (half::f16::from_f32(w), 0.0)));
+            bucket.push((u8::from(d.edge()), (half::f16::from_f32(w), 0.0)));
         }
     }
 
@@ -216,18 +216,20 @@ impl Profile {
             let mut bucket = bucket_mutex.value().write();
             // Update regrets
             for (edge, delta) in regret_vec {
-                if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
+                let edge_key = u8::from(edge);
+                if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge_key) {
                     let new_regret = existing.1 .1 + delta;
                     existing.1 .1 = self::safe_clamp(new_regret, current_min, current_max);
                 } else {
                     // Check delta for NaN before storing
                     let safe_delta = self::safe_clamp(delta, current_min, current_max);
-                    bucket.push((edge, (f16::from_f32(0.0), safe_delta)));
+                    bucket.push((edge_key, (f16::from_f32(0.0), safe_delta)));
                 }
             }
             // Update policies
             for (edge, delta) in policy_vec {
-                if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
+                let edge_key = u8::from(edge);
+                if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge_key) {
                     let prev = f32::from(existing.1 .0);
                     let new_policy = prev + delta;
 
@@ -240,7 +242,7 @@ impl Profile {
                 } else {
                     // Check delta for validity before storing
                     let safe_delta = if delta.is_nan() || delta < 0.0 { crate::POLICY_MIN } else { delta };
-                    bucket.push((edge, (f16::from_f32(safe_delta), 0.0)));
+                    bucket.push((edge_key, (f16::from_f32(safe_delta), 0.0)));
                 }
             }
         }
@@ -270,7 +272,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             let bucket = bucket_mutex.value().read();
             bucket
                 .iter()
-                .find_map(|(e, (p, _))| if e == edge { Some(f32::from(*p)) } else { None })
+                .find_map(|(e, (p, _))| if *e == u8::from(*edge) { Some(f32::from(*p)) } else { None })
                 .unwrap_or_default()
         } else {
             0.0
@@ -281,7 +283,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             let bucket = bucket_mutex.value().read();
             bucket
                 .iter()
-                .find_map(|(e, (_, r))| if e == edge { Some(*r) } else { None })
+                .find_map(|(e, (_, r))| if *e == u8::from(*edge) { Some(*r) } else { None })
                 .unwrap_or_default()
         } else {
             0.0
@@ -320,7 +322,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             for edge in choices_vec.iter().copied() {
                 let regret_raw = bucket
                     .iter()
-                    .find_map(|(e, (_, r))| if *e == edge { Some(*r) } else { None })
+                    .find_map(|(e, (_, r))| if *e == u8::from(edge) { Some(*r) } else { None })
                     .unwrap_or_default();
                 small.push((edge, regret_raw.max(crate::POLICY_MIN)));
             }
@@ -468,7 +470,7 @@ impl Profile {
                 let edge = Edge::random();
                 let policy: f32 = rand::thread_rng().gen_range(0.0..1.0);
                 let regret: f32 = rand::thread_rng().gen_range(-1.0..1.0);
-                bucket.push((edge, (f16::from_f32(policy), regret)));
+                bucket.push((u8::from(edge), (f16::from_f32(policy), regret)));
             }
         }
 
@@ -552,10 +554,11 @@ impl Profile {
             let edges_vec = bucket_entry.value().read();
 
             for (edge, (policy, regret)) in edges_vec.iter() {
+                let edge_enum: Edge = (*edge).into();
                 chunk_histories.push(u64::from(*bucket.history()) as i64);
                 chunk_presents.push(u64::from(*bucket.present()) as i64);
                 chunk_futures.push(u64::from(*bucket.futures()) as i64);
-                chunk_edges.push(u64::from(edge.clone()) as u32); // Note: Edge values must fit in u32
+                chunk_edges.push(u64::from(edge_enum) as u32); // Edge values must fit in u32
                 chunk_regrets.push(*regret);
                 chunk_policies.push(f32::from(*policy));
 
@@ -736,7 +739,7 @@ impl Profile {
                         .entry(info)
                         .or_insert_with(|| RwLock::new(SmallVec::new()));
                     let mut bucket = bucket_mutex.value().write();
-                    bucket.push((edge, (f16::from_f32(policy), regret)));
+                    bucket.push((u8::from(edge), (f16::from_f32(policy), regret)));
 
                     _total_records += 1;
                     progress.inc(1);
@@ -819,7 +822,7 @@ impl Profile {
                 .entry(info)
                 .or_insert_with(|| RwLock::new(SmallVec::new()));
             let mut bucket = bucket_mutex.value().write();
-            bucket.push((edge, (f16::from_f32(policy), regret)));
+            bucket.push((u8::from(edge), (f16::from_f32(policy), regret)));
         }
 
         Self {
@@ -893,7 +896,7 @@ impl ProfileBuilder {
             regret_min: self.regret_min,
             regret_max: self.regret_max,
         };
-        let mut warm_start = self.warm_start;
+        let warm_start = self.warm_start;
         // Populate profile with warm-start decisions if any.
         (profile, warm_start)
     }

@@ -1,6 +1,5 @@
 use super::edge::Edge;
 use super::turn::Turn;
-use super::game::Game;
 use crate::mccfr::traits::blueprint::Blueprint;
 use crate::mccfr::traits::profile::Profile;
 use std::collections::BTreeMap;
