@@ -50,7 +50,14 @@ impl Odds {
             .binary_search_by(|p| p.partial_cmp(&odds).expect("not NaN"))
             .unwrap_or_else(|i| i.saturating_sub(1))]
     }
+
+    #[cfg(not(feature = "shortdeck"))]
     pub const GRID: [Self; 10] = Self::PREF_RAISES;
+
+    #[cfg(feature = "shortdeck")]
+    pub const GRID: [Self; 5] = Self::PREF_RAISES;
+
+    #[cfg(not(feature = "shortdeck"))]
     pub const PREF_RAISES: [Self; 10] = [
         Self(1, 4), // 0.25
         Self(1, 3), // 0.33
@@ -63,6 +70,17 @@ impl Odds {
         Self(3, 1), // 3.00
         Self(4, 1), // 4.00
     ];
+
+    #[cfg(feature = "shortdeck")]
+    pub const PREF_RAISES: [Self; 5] = [
+        Self(1, 4), // 0.25
+        Self(1, 2), // 0.50
+        Self(1, 1), // 1.00
+        Self(2, 1), // 2.00
+        Self(4, 1), // 4.00
+    ];
+
+    #[cfg(not(feature = "shortdeck"))]
     pub const FLOP_RAISES: [Self; 5] = [
         Self(1, 2), // 0.50
         Self(3, 4), // 0.75
@@ -70,15 +88,37 @@ impl Odds {
         Self(3, 2), // 1.50
         Self(2, 1), // 2.00
     ];
+
+    #[cfg(feature = "shortdeck")]
+    pub const FLOP_RAISES: [Self; 3] = [
+        Self(1, 2), // 0.50
+        Self(1, 1), // 1.00
+        Self(2, 1), // 2.00
+    ];
+
+    #[cfg(not(feature = "shortdeck"))]
     pub const LATE_RAISES: [Self; 4] = [
         Self(1, 2), // 0.50
         Self(1, 1), // 1.00
         Self(3, 2), // 1.50
         Self(2, 1), // 2.00
     ];
+
+    #[cfg(feature = "shortdeck")]
+    pub const LATE_RAISES: [Self; 2] = [
+        Self(1, 1), // 1.00
+        Self(2, 1), // 2.00
+    ];
+
+    #[cfg(not(feature = "shortdeck"))]
     pub const LAST_RAISES: [Self; 2] = [
         Self(1, 1), // 1.00
         Self(3, 2), // 1.50
+    ];
+
+    #[cfg(feature = "shortdeck")]
+    pub const LAST_RAISES: [Self; 1] = [
+        Self(1, 1), // 1.00
     ];
 }
 

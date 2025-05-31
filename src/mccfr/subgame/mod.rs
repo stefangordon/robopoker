@@ -44,7 +44,11 @@ use crate::mccfr::nlhe::encoder::BetSizer;
 
 /// Enhanced bet sizes for subgame solving using the full preflop grid (10 sizes from 0.25x to 4x pot)
 /// This provides 2-5x more granularity than the typical post-flop grids used in the blueprint
+#[cfg(not(feature = "shortdeck"))]
 pub const SUBGAME_RAISES: [Odds; 10] = Odds::GRID;
+
+#[cfg(feature = "shortdeck")]
+pub const SUBGAME_RAISES: [Odds; 5] = Odds::GRID;
 
 /// Minimum iterations for subgame solving
 pub const SUBGAME_MIN_ITERATIONS: usize = 100;

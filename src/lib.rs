@@ -14,9 +14,6 @@ pub mod transport;
 pub mod wasm;
 
 #[cfg(feature = "subgame")]
-pub mod subgame;
-
-#[cfg(feature = "subgame")]
 pub use analysis::Server;
 
 pub use cards::*;
@@ -81,7 +78,7 @@ const CFR_TREE_COUNT_RPS: usize = 8192;
 pub const CHECKPOINT_HOURS: u64 = 6;
 
 // nlhe mccfr parameters
-const CFR_BATCH_SIZE_NLHE: usize = 256;
+const CFR_BATCH_SIZE_NLHE: usize = 128;
 const CFR_TREE_COUNT_NLHE: usize = 0x1000000;
 
 /// profile average sampling parameters

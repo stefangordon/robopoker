@@ -13,15 +13,7 @@ fn serialize_edge<S>(edge: &Edge, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    let edge_str = match edge {
-        Edge::Draw => "?".to_string(),
-        Edge::Fold => "F".to_string(),
-        Edge::Check => "O".to_string(),
-        Edge::Call => "*".to_string(),
-        Edge::Shove => "!".to_string(),
-        Edge::Raise(odds) => format!("{}:{}", odds.0, odds.1), // Use precise ratio format
-    };
-    serializer.serialize_str(&edge_str)
+    serializer.serialize_str(&edge.to_string())
 }
 
 impl Decision {
@@ -41,6 +33,15 @@ impl From<(Edge, Probability)> for Decision {
         Self {
             edge,
             prob,
+        }
+    }
+}
+
+impl From<tokio_postgres::Row> for Decision {
+    fn from(row: tokio_postgres::Row) -> Self {
+        Self {
+            edge: Edge::from(row.get::<_, i64>("edge") as u64),
+            prob: Probability::from(row.get::<_, f32>("policy")),
         }
     }
 } 

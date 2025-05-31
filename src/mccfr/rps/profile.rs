@@ -42,4 +42,12 @@ impl Profile for RPS {
             .map(|(_, r)| *r)
             .unwrap_or_default()
     }
+
+    fn current_regret_min(&self) -> crate::Utility {
+        self.regret_min
+    }
+
+    fn current_regret_max(&self) -> crate::Utility {
+        self.regret_max
+    }
 }

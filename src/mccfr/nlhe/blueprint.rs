@@ -128,9 +128,9 @@ impl Blueprint for super::solver::NLHE {
                         let bucket_mutex = profile_ref
                             .encounters
                             .entry(info)
-                            .or_insert_with(|| parking_lot::Mutex::new(smallvec::SmallVec::new()));
+                            .or_insert_with(|| parking_lot::RwLock::new(smallvec::SmallVec::new()));
 
-                        let mut bucket = bucket_mutex.lock();
+                        let mut bucket = bucket_mutex.value().write();
 
                         // Search for edge record
                         if let Some((_, entry)) = bucket.iter_mut().find(|(e, _)| *e == edge) {

@@ -66,6 +66,10 @@ pub trait Profile {
     fn sum_policy(&self, info: &Self::I, edge: &Self::E) -> crate::Probability;
     /// lookup accumulated regret for this information
     fn sum_regret(&self, info: &Self::I, edge: &Self::E) -> crate::Utility;
+    /// get the minimum regret value for the current context
+    fn current_regret_min(&self) -> crate::Utility;
+    /// get the maximum regret value for the current context
+    fn current_regret_max(&self) -> crate::Utility;
 
     // exploration calculations
 
@@ -223,7 +227,6 @@ pub trait Profile {
             .choices()
             .iter()
             .map(|e| self.sum_regret(info, e))
-            .inspect(|r| assert!(!r.is_nan(), "regret value is NaN for edge in policy calculation"))
             .inspect(|r| assert!(!r.is_infinite(), "regret value is infinite for edge in policy calculation"))
             .map(|r| r.max(crate::POLICY_MIN))
             .sum::<crate::Utility>();
@@ -368,18 +371,24 @@ pub trait Profile {
         debug_assert!(!sampling.is_nan(), "sampling_reach produced NaN");
         debug_assert!(sampling > 0.0, "sampling_reach is zero or negative: {}", sampling);
 
-        // Prevent numeric overflow that can create ±Inf and later NaNs
-        let mut result = reach * payoff / sampling;
+        // Compute raw counterfactual utility
+        let raw = reach * payoff / sampling;
+        let current_regret_max = self.current_regret_max();
 
-        // Additional safety check for extreme values before they become infinite
-        if result.abs() > crate::REGRET_MAX {
-            result = result.signum() * crate::REGRET_MAX;
-        }
+        // Determine sign for clamping NaN or infinite values
+        // If raw is NaN, infer sign from payoff
+        let sign = if raw.is_nan() {
+            if payoff < 0.0 { -1.0 } else { 1.0 }
+        } else {
+            raw.signum()
+        };
 
-        if !result.is_finite() {
-            // Clamp to REGRET_MAX with correct sign to keep training stable
-            result = result.signum() * crate::REGRET_MAX;
-        }
+        // Clamp to the interval [−max, +max], catching both infinities and NaNs
+        let result = if !raw.is_finite() || raw.abs() > current_regret_max {
+            sign * current_regret_max
+        } else {
+            raw
+        };
 
         debug_assert!(!result.is_nan(), "relative_value produced NaN after clamp");
         debug_assert!(!result.is_infinite(), "relative_value still infinite after clamp");

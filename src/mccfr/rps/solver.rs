@@ -1,10 +1,10 @@
 use super::edge::Edge;
 use super::turn::Turn;
+use super::game::Game;
 use crate::mccfr::traits::blueprint::Blueprint;
 use crate::mccfr::traits::profile::Profile;
 use std::collections::BTreeMap;
 
-#[derive(Default)]
 /// Blueprint represents the complete solution for the Rock Paper Scissors game,
 /// storing accumulated regret and policy values that are built up during training.
 /// It implements both Profile (for tracking historical regrets and policies) and
@@ -14,6 +14,19 @@ use std::collections::BTreeMap;
 pub struct RPS {
     pub(super) epochs: usize,
     pub(super) encounters: BTreeMap<Turn, BTreeMap<Edge, (crate::Probability, crate::Utility)>>,
+    pub(super) regret_min: crate::Utility,
+    pub(super) regret_max: crate::Utility,
+}
+
+impl Default for RPS {
+    fn default() -> Self {
+        Self {
+            epochs: 0,
+            encounters: BTreeMap::default(),
+            regret_min: crate::REGRET_MIN,
+            regret_max: crate::REGRET_MAX,
+        }
+    }
 }
 
 impl std::fmt::Display for RPS {

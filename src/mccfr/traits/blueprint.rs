@@ -92,13 +92,14 @@ pub trait Blueprint: Send + Sync {
 
     /// Updates accumulated regret values for each edge in the counterfactual.
     fn update_regret(&mut self, cfr: &Counterfactual<Self::E, Self::I>) {
-        let ref info = cfr.0.clone();
-        for (edge, regret) in cfr.1.iter() {
-            let discount = self.discount(Some(self.profile().sum_regret(info, edge)));
-            let accumulated = self.profile().sum_regret(info, edge);
-            let accumulated = accumulated * discount;
-            let accumulated = accumulated + regret;
-            let accumulated = accumulated.max(crate::REGRET_MIN).min(crate::REGRET_MAX);
+        let info = &cfr.0.clone();
+        for (edge, regret) in &cfr.1 {
+            let prev = self.profile().sum_regret(info, edge);
+            let accumulated = {
+                let discounted = prev * self.discount(Some(prev));
+                (discounted + regret)
+                    .clamp(crate::REGRET_MIN, crate::REGRET_MAX)
+            };
             *self.mut_regret(info, edge) = accumulated;
         }
     }

@@ -1,4 +1,7 @@
-use super::{Edge, Game, Info, Turn};
+use crate::gameplay::edge::Edge;
+use crate::mccfr::nlhe::Game;
+use crate::mccfr::nlhe::info::Info;
+use crate::gameplay::turn::Turn;
 use super::{SUBGAME_MIN_ITERATIONS, SUBGAME_MAX_ITERATIONS};
 use crate::mccfr::types::decision::Decision;
 use crate::cards::isomorphism::Isomorphism;

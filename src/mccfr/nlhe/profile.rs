@@ -6,7 +6,7 @@ use crate::cards::street::Street;
 use crate::Arbitrary;
 use zstd::stream::Decoder as ZDecoder;
 use dashmap::DashMap;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use crate::mccfr::types::policy::Policy;
 use crate::mccfr::types::decision::Decision;
 use crate::mccfr::traits::info::Info as InfoTrait;
@@ -61,7 +61,9 @@ fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
 
 pub struct Profile {
     pub(super) iterations: usize,
-    pub(super) encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher>,
+    pub(super) encounters: DashMap<Info, RwLock<Bucket>, FxBuildHasher>,
+    pub(super) regret_min: crate::Utility,
+    pub(super) regret_max: crate::Utility,
 }
 
 impl Default for Profile {
@@ -69,6 +71,8 @@ impl Default for Profile {
         Self {
             iterations: 0,
             encounters: DashMap::with_hasher(FxBuildHasher::default()),
+            regret_min: crate::REGRET_MIN,
+            regret_max: crate::REGRET_MAX,
         }
     }
 }
@@ -101,7 +105,7 @@ impl Profile {
 
         for bucket_entry in self.encounters.iter() {
             infosets += 1;
-            let bucket = bucket_entry.value().lock();
+            let bucket = bucket_entry.value().read();
             let count = bucket.len();
             total_edges += count;
             min_edges = min_edges.min(count);
@@ -189,8 +193,8 @@ impl Profile {
         let bucket_mutex = self
             .encounters
             .entry(*info)
-            .or_insert_with(|| Mutex::new(SmallVec::new()));
-        let mut bucket = bucket_mutex.lock();
+            .or_insert_with(|| RwLock::new(SmallVec::new()));
+        let mut bucket = bucket_mutex.value().write();
         // Normalise weights to sum to 1.
         let total: f32 = decisions.iter().map(|d| d.weight()).sum();
         let total = total.max(crate::POLICY_MIN);
@@ -202,21 +206,22 @@ impl Profile {
 
     /// Apply regret/policy deltas concurrently-safe (called by subgame solver).
     pub fn apply_updates(&self, updates: Vec<(Info, crate::mccfr::types::policy::Policy<Edge>, crate::mccfr::types::policy::Policy<Edge>)>) {
+        let current_min = self.regret_min;
+        let current_max = self.regret_max;
         for (info, regret_vec, policy_vec) in updates {
             let bucket_mutex = self
                 .encounters
                 .entry(info)
-                .or_insert_with(|| Mutex::new(SmallVec::new()));
-            let mut bucket = bucket_mutex.lock();
+                .or_insert_with(|| RwLock::new(SmallVec::new()));
+            let mut bucket = bucket_mutex.value().write();
             // Update regrets
             for (edge, delta) in regret_vec {
                 if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge) {
                     let new_regret = existing.1 .1 + delta;
-                    existing.1 .1 = self::safe_clamp(new_regret, crate::REGRET_MIN, crate::REGRET_MAX);
-
+                    existing.1 .1 = self::safe_clamp(new_regret, current_min, current_max);
                 } else {
                     // Check delta for NaN before storing
-                    let safe_delta = self::safe_clamp(delta, crate::REGRET_MIN, crate::REGRET_MAX) ;
+                    let safe_delta = self::safe_clamp(delta, current_min, current_max);
                     bucket.push((edge, (f16::from_f32(0.0), safe_delta)));
                 }
             }
@@ -262,7 +267,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
     }
     fn sum_policy(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
         if let Some(bucket_mutex) = self.encounters.get(info) {
-            let bucket = bucket_mutex.value().lock();
+            let bucket = bucket_mutex.value().read();
             bucket
                 .iter()
                 .find_map(|(e, (p, _))| if e == edge { Some(f32::from(*p)) } else { None })
@@ -272,15 +277,29 @@ impl crate::mccfr::traits::profile::Profile for Profile {
         }
     }
     fn sum_regret(&self, info: &Self::I, edge: &Self::E) -> crate::Utility {
-        if let Some(bucket_mutex) = self.encounters.get(info) {
-            let bucket = bucket_mutex.value().lock();
+        let regret_val = if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
             bucket
                 .iter()
                 .find_map(|(e, (_, r))| if e == edge { Some(*r) } else { None })
                 .unwrap_or_default()
         } else {
             0.0
+        };
+
+        if regret_val.is_nan() {
+            // Ensure NaN is not returned. This indicates a NaN was stored previously.
+            log::warn!("sum_regret: Encountered stored NaN for info: {:?}, edge: {:?}. Returning 0.0 instead.", info, edge);
+            0.0
+        } else {
+            regret_val
         }
+    }
+    fn current_regret_min(&self) -> crate::Utility {
+        self.regret_min
+    }
+    fn current_regret_max(&self) -> crate::Utility {
+        self.regret_max
     }
 
     // -------------------------------------------------------------------
@@ -297,7 +316,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
         let mut small: SmallVec<[(Self::E, f32); 8]> = SmallVec::with_capacity(choices_vec.len().min(8));
 
         if let Some(bucket_mutex) = self.encounters.get(&info) {
-            let bucket = bucket_mutex.value().lock();
+            let bucket = bucket_mutex.value().read();
             for edge in choices_vec.iter().copied() {
                 let regret_raw = bucket
                     .iter()
@@ -443,8 +462,8 @@ impl Profile {
             let bucket_mutex = self
                 .encounters
                 .entry(info)
-                .or_insert_with(|| Mutex::new(SmallVec::new()));
-            let mut bucket = bucket_mutex.lock();
+                .or_insert_with(|| RwLock::new(SmallVec::new()));
+            let mut bucket = bucket_mutex.value().write();
             for _ in 0..edges_per_bucket {
                 let edge = Edge::random();
                 let policy: f32 = rand::thread_rng().gen_range(0.0..1.0);
@@ -475,7 +494,7 @@ impl Profile {
 
         // Calculate total records
         let total_records: usize = self.encounters.iter()
-            .map(|entry| entry.value().lock().len())
+            .map(|entry| entry.value().read().len())
             .sum();
 
                 log::info!("Saving blueprint to {} ({} records)", path_str, total_records);
@@ -530,7 +549,7 @@ impl Profile {
 
         for bucket_entry in self.encounters.iter() {
             let bucket = bucket_entry.key();
-            let edges_vec = bucket_entry.value().lock();
+            let edges_vec = bucket_entry.value().read();
 
             for (edge, (policy, regret)) in edges_vec.iter() {
                 chunk_histories.push(u64::from(*bucket.history()) as i64);
@@ -661,7 +680,7 @@ impl Profile {
         let progress = crate::progress(total_rows);
         progress.set_message("Loading blueprint from parquet");
 
-        let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> =
+        let encounters: DashMap<Info, RwLock<Bucket>, FxBuildHasher> =
             DashMap::with_hasher(FxBuildHasher::default());
 
         let mut _total_records = 0;
@@ -715,8 +734,8 @@ impl Profile {
                     let info = Info::from((history, present, futures));
                     let bucket_mutex = encounters
                         .entry(info)
-                        .or_insert_with(|| Mutex::new(SmallVec::new()));
-                    let mut bucket = bucket_mutex.lock();
+                        .or_insert_with(|| RwLock::new(SmallVec::new()));
+                    let mut bucket = bucket_mutex.value().write();
                     bucket.push((edge, (f16::from_f32(policy), regret)));
 
                     _total_records += 1;
@@ -730,6 +749,8 @@ impl Profile {
         Self {
             encounters,
             iterations: 0,
+            regret_min: crate::REGRET_MIN,
+            regret_max: crate::REGRET_MAX,
         }
     }
 
@@ -757,7 +778,7 @@ impl Profile {
         let mut skip = [0u8; PGCOPY_HEADER_SIZE];
         reader.read_exact(&mut skip).expect("Failed to skip pgcopy header");
 
-        let encounters: DashMap<Info, Mutex<Bucket>, FxBuildHasher> = DashMap::with_hasher(FxBuildHasher::default());
+        let encounters: DashMap<Info, RwLock<Bucket>, FxBuildHasher> = DashMap::with_hasher(FxBuildHasher::default());
         let mut header = [0u8; 2];
         let mut record = [0u8; PGCOPY_RECORD_SIZE - 2]; // 2-byte header already consumed + 64 payload
 
@@ -796,14 +817,16 @@ impl Profile {
             let info = Info::from((history, present, futures));
             let bucket_mutex = encounters
                 .entry(info)
-                .or_insert_with(|| Mutex::new(SmallVec::new()));
-            let mut bucket = bucket_mutex.lock();
+                .or_insert_with(|| RwLock::new(SmallVec::new()));
+            let mut bucket = bucket_mutex.value().write();
             bucket.push((edge, (f16::from_f32(policy), regret)));
         }
 
         Self {
             encounters,
             iterations: 0,
+            regret_min: crate::REGRET_MIN,
+            regret_max: crate::REGRET_MAX,
         }
     }
 }
@@ -864,7 +887,14 @@ impl ProfileBuilder {
     /// the warm-start vector so the caller can initialise the root infoset
     /// once it is known.
     pub fn build(self) -> (Profile, Vec<Decision>) {
-        // TODO: patch Profile to make use of regret_min / regret_max.
-        (Profile::default(), self.warm_start)
+        let profile = Profile {
+            iterations: 0,
+            encounters: DashMap::with_hasher(FxBuildHasher::default()),
+            regret_min: self.regret_min,
+            regret_max: self.regret_max,
+        };
+        let mut warm_start = self.warm_start;
+        // Populate profile with warm-start decisions if any.
+        (profile, warm_start)
     }
 }
