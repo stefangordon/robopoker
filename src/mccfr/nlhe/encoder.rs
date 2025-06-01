@@ -57,10 +57,13 @@ impl<S: BetSizer> Encoder<S> {
     }
 
     pub fn abstraction(&self, iso: &Isomorphism) -> Abstraction {
+        // We call this hundreds of thousands of times during roll-outs, so avoid
+        // the `format!` allocation that happens even on success. If an entry is
+        // ever missing we panic with a concise message.
         self.lookup
             .get(iso)
             .copied()
-            .expect(&format!("Missing abstraction for isomorphism {:?}. All abstractions should be preloaded.", iso))
+            .unwrap_or_else(|| panic!("Missing abstraction for isomorphism – lookup table incomplete"))
     }
 
     /// Get a clone of the abstraction lookup

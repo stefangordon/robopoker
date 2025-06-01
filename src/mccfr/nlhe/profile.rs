@@ -767,12 +767,18 @@ impl Profile {
 
         progress.finish_with_message("Blueprint loaded from parquet");
 
-        Self {
+        let profile = Self {
             encounters,
             iterations: 0,
             regret_min: crate::REGRET_MIN,
             regret_max: crate::REGRET_MAX,
-        }
+        };
+
+        // Always log aggregate statistics after loading
+        #[cfg(feature = "native")]
+        profile.log_stats();
+
+        profile
     }
 
     /// Load profile data from legacy zstd-compressed PostgreSQL binary format files.
@@ -843,12 +849,18 @@ impl Profile {
             bucket.push((u8::from(edge), (f16::from_f32(policy), regret)));
         }
 
-        Self {
+        let profile = Self {
             encounters,
             iterations: 0,
             regret_min: crate::REGRET_MIN,
             regret_max: crate::REGRET_MAX,
-        }
+        };
+
+        // Log stats after loading legacy format as well
+        #[cfg(feature = "native")]
+        profile.log_stats();
+
+        profile
     }
 }
 

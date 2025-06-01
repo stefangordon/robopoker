@@ -324,9 +324,25 @@ impl Game {
 impl Game {
     /// we're waiting for showdown or everyone folded
     fn must_stop(&self) -> bool {
+        // Count seats that have not folded
+        let active = self
+            .seats
+            .iter()
+            .filter(|s| s.state() != State::Folding)
+            .count();
+
+        // If every seat has folded (active == 0) we have entered an
+        // impossible terminal state where no one can win the pot.  Do
+        // NOT treat this as hand-finished; let the state machine advance
+        // until at least one seat remains so chips are awarded correctly.
+        if active == 0 {
+            return false;
+        }
+
         if self.street() == Street::Rive {
             self.is_everyone_alright()
         } else {
+            // Pre-river we stop as soon as exactly one seat remains.
             self.is_everyone_folding()
         }
     }
