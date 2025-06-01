@@ -16,3 +16,4 @@ pub mod ranking;
 pub mod street;
 pub mod strength;
 pub mod suit;
+pub mod lookup_evaluator;

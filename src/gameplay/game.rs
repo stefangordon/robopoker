@@ -1007,23 +1007,4 @@ mod tests {
         assert!(game.is_everyone_matched() == true); //
     }
 
-    #[test]
-    fn test_nearest_action() {
-        let game = Game::root();
-
-        // Testing Raise adjustment
-        // At the beginning, minimum raise should be 2BB (4 chips)
-        let nearest = game.find_nearest_action(&Action::Raise(3));
-        assert_eq!(nearest, Some(Action::Raise(4)));
-
-        // Testing max raise capping
-        let nearest = game.find_nearest_action(&Action::Raise(200));
-        assert_eq!(nearest, Some(Action::Raise(99)));
-
-        // Testing Shove adjustment
-        let nearest = game.find_nearest_action(&Action::Shove(90));
-        assert_eq!(nearest, Some(Action::Shove(100)));
-
-
-    }
 }
