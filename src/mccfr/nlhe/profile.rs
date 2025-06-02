@@ -51,7 +51,7 @@ const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
 
 // Store Edge as compact u8 key inside buckets to reduce memory footprint
 // The Edge <-> u8 bijection is already implemented via From conversions.
-type Bucket = SmallVec<[(u8, (f16, crate::Utility)); 3]>;
+type Bucket = SmallVec<[(u8, (f16, crate::Utility)); 4]>;
 
 #[inline(always)]
 fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
@@ -165,6 +165,9 @@ impl Profile {
         let mut min_edges = usize::MAX;
         let mut max_edges = 0usize;
 
+        // Add edge count distribution tracking
+        let mut edge_count_dist = [0usize; 14]; // 0-13 edges
+
         let mut policy_min = INFINITY;
         let mut policy_max = NEG_INFINITY;
         let mut regret_min = INFINITY;
@@ -182,6 +185,11 @@ impl Profile {
             total_edges += count;
             min_edges = min_edges.min(count);
             max_edges = max_edges.max(count);
+
+            // Track edge count distribution
+            if count < edge_count_dist.len() {
+                edge_count_dist[count] += 1;
+            }
 
             for (_, (policy, regret)) in bucket.iter() {
                 let pol_f32 = f32::from(*policy);
@@ -254,6 +262,19 @@ impl Profile {
         log::info!("  [10, 100):   {} edges", policy_buckets[2]);
         log::info!("  [100, 1k):   {} edges", policy_buckets[3]);
         log::info!("  >= 1k:       {} edges", policy_buckets[4]);
+
+        // Add edge count distribution
+        log::info!("Edge count distribution:");
+        let mut cumulative = 0usize;
+        for (count, freq) in edge_count_dist.iter().enumerate() {
+            if *freq > 0 {
+                cumulative += freq;
+                let pct = *freq as f64 / infosets as f64 * 100.0;
+                let cum_pct = cumulative as f64 / infosets as f64 * 100.0;
+                log::info!("  {} edges: {:>10} infosets ({:>5.1}%, cum {:>5.1}%)",
+                    count, freq, pct, cum_pct);
+            }
+        }
 
         // Add convergence metrics
         let (convergence_ratio, determinism_ratio, avg_entropy) = self.convergence_metrics();

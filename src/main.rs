@@ -1,6 +1,16 @@
 use clap::Parser;
 use robopokerlib::*;
 
+// Use jemalloc as the global allocator on supported platforms
+// This provides better memory efficiency and performance for applications
+// with many small allocations, like MCCFR with billions of infosets
+#[cfg(all(feature = "native", not(target_env = "msvc")))]
+use jemallocator::Jemalloc;
+
+#[cfg(all(feature = "native", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[tokio::main]
 async fn main() {
     crate::logs();

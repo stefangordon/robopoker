@@ -46,6 +46,7 @@ ahash = "0.8"
 half = "2.4"
 memmap2 = { version = "0.9", optional = true }
 arrow2 = { version = "0.18", features = ["io_parquet", "io_parquet_compression"] }
+jemallocator = { version = "0.5", optional = true }
 
 [lib]
 name = "robopokerlib"
@@ -76,7 +77,8 @@ native = [
     "actix-web",
     "actix-cors",
     "env_logger",
-    "memmap2"
+    "memmap2",
+    "jemallocator"
 ]
 
 [[bin]]
