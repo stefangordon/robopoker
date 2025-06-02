@@ -83,7 +83,7 @@ const CFR_TREE_COUNT_NLHE: usize = 0x1000000;
 
 /// profile average sampling parameters
 const SAMPLING_THRESHOLD: Entropy = 1.0;
-const SAMPLING_ACTIVATION: Energy = 0.0;
+const SAMPLING_ACTIVATION: Energy = 0.2;
 const SAMPLING_EXPLORATION: Probability = 0.01;
 
 // regret matching parameters with clamping to prevent numerical instability

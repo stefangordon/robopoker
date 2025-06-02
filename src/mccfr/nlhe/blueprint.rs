@@ -76,6 +76,10 @@ impl Blueprint for super::solver::NLHE {
                 progress.inc(1);
                 if last_checkpoint.elapsed() >= checkpoint_interval {
                     self.profile.save();
+                    
+                    // Also log stats during checkpoint
+                    self.profile.log_stats();
+                    
                     last_checkpoint = Instant::now();
                     log::info!(
                         "Checkpoint saved after {} elapsed hours (iteration {})",

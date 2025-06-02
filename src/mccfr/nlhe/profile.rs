@@ -51,7 +51,7 @@ const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
 
 // Store Edge as compact u8 key inside buckets to reduce memory footprint
 // The Edge <-> u8 bijection is already implemented via From conversions.
-type Bucket = SmallVec<[(u8, (f16, crate::Utility)); 4]>;
+type Bucket = SmallVec<[(u8, (f16, crate::Utility)); 3]>;
 
 #[inline(always)]
 fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
@@ -80,6 +80,78 @@ impl Default for Profile {
 impl Profile {
     fn name() -> String {
         "blueprint".to_string()
+    }
+
+    /// Calculate convergence metrics for monitoring training progress
+    pub fn convergence_metrics(&self) -> (f64, f64, f64) {
+        let mut total_edges = 0usize;
+        let mut near_zero_regrets = 0usize;
+        let mut high_confidence_actions = 0usize;
+        let mut total_entropy = 0.0f64;
+
+        const ZERO_THRESHOLD: f32 = 1.0;
+        const HIGH_CONFIDENCE_THRESHOLD: f32 = 0.9;
+
+        for bucket_entry in self.encounters.iter() {
+            let bucket = bucket_entry.value().read();
+            let n = bucket.len();
+            if n == 0 { continue; }
+
+            // Count near-zero regrets
+            for (_, (_, regret)) in bucket.iter() {
+                total_edges += 1;
+                if regret.abs() < ZERO_THRESHOLD {
+                    near_zero_regrets += 1;
+                }
+            }
+
+            // Calculate strategy entropy for this infoset
+            let weights: Vec<f32> = bucket.iter()
+                .map(|(_, (policy, _))| f32::from(*policy).max(0.0))
+                .collect();
+            let sum: f32 = weights.iter().sum();
+
+            if sum > 0.0 {
+                let mut entropy = 0.0f64;
+                let mut max_prob = 0.0f32;
+
+                for w in &weights {
+                    let p = w / sum;
+                    if p > max_prob {
+                        max_prob = p;
+                    }
+                    if p > 0.0 {
+                        entropy -= (p as f64) * (p as f64).ln();
+                    }
+                }
+
+                if max_prob > HIGH_CONFIDENCE_THRESHOLD {
+                    high_confidence_actions += 1;
+                }
+
+                total_entropy += entropy;
+            }
+        }
+
+        let convergence_ratio = if total_edges > 0 {
+            near_zero_regrets as f64 / total_edges as f64
+        } else {
+            0.0
+        };
+
+        let determinism_ratio = if self.encounters.len() > 0 {
+            high_confidence_actions as f64 / self.encounters.len() as f64
+        } else {
+            0.0
+        };
+
+        let avg_entropy = if self.encounters.len() > 0 {
+            total_entropy / self.encounters.len() as f64
+        } else {
+            0.0
+        };
+
+        (convergence_ratio, determinism_ratio, avg_entropy)
     }
 
     /// Log aggregate statistics for regret and policy vectors instead of writing to disk.
@@ -182,6 +254,23 @@ impl Profile {
         log::info!("  [10, 100):   {} edges", policy_buckets[2]);
         log::info!("  [100, 1k):   {} edges", policy_buckets[3]);
         log::info!("  >= 1k:       {} edges", policy_buckets[4]);
+
+        // Add convergence metrics
+        let (convergence_ratio, determinism_ratio, avg_entropy) = self.convergence_metrics();
+        log::info!("Convergence metrics:");
+        log::info!("  Near-zero regrets: {:.1}%", convergence_ratio * 100.0);
+        log::info!("  High-confidence actions: {:.1}%", determinism_ratio * 100.0);
+        log::info!("  Average entropy: {:.3}", avg_entropy);
+
+        // Additional derived metrics
+        let negative_regrets: usize = regret_buckets[0..4].iter().sum();
+        let positive_regrets: usize = regret_buckets[4..].iter().sum();
+        let total_nonzero = negative_regrets + positive_regrets;
+        if total_nonzero > 0 {
+            let balance_ratio = negative_regrets as f64 / total_nonzero as f64;
+            log::info!("  Negative/Total ratio: {:.1}% (ideal ~50%)", balance_ratio * 100.0);
+        }
+
         log::info!("-----------------------------------------------------");
     }
 
