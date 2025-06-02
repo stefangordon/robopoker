@@ -78,8 +78,8 @@ const CFR_TREE_COUNT_RPS: usize = 8192;
 pub const CHECKPOINT_HOURS: u64 = 6;
 
 // nlhe mccfr parameters
-const CFR_BATCH_SIZE_NLHE: usize = 512;
-const CFR_TREE_COUNT_NLHE: usize = 0x1000000;
+const CFR_BATCH_SIZE_NLHE: usize = 1024;
+const CFR_TREE_COUNT_NLHE: usize = 0x2000000;
 
 /// profile average sampling parameters
 const SAMPLING_THRESHOLD: Entropy = 1.0;

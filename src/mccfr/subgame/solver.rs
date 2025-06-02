@@ -325,43 +325,65 @@ impl SubgameSolver {
 
     /// Extract root strategy using positive-regret matching with fallbacks.
     fn root_strategy(&self, info: &Info) -> Vec<Decision> {
-        let edges: Vec<(Edge, f32)> = info
-            .choices()
-            .into_iter()
-            .map(|edge| {
-                let regret = self.profile.sum_regret(info, &edge);
-                (edge, regret)
-            })
-            .collect();
-
-        let pos_sum: f32 = edges.iter().map(|(_, r)| if *r > 0.0 { *r } else { 0.0 }).sum();
+        // Get all possible choices for this info
+        let all_choices = info.choices();
+        if all_choices.is_empty() {
+            return Vec::new();
+        }
+        
+        // Get all regrets in a single batch operation
+        let all_regrets = self.profile.get_all_regrets(info);
+        
+        // Calculate sum of positive regrets across ALL possible choices
+        let mut pos_sum = 0.0f32;
+        let mut regrets_with_edges = Vec::with_capacity(all_choices.len());
+        
+        for choice_edge in all_choices.iter() {
+            let regret = all_regrets
+                .iter()
+                .find_map(|(e, r)| if e == choice_edge { Some(*r) } else { None })
+                .unwrap_or(0.0);
+            
+            regrets_with_edges.push((*choice_edge, regret));
+            if regret > 0.0 {
+                pos_sum += regret;
+            }
+        }
 
         if pos_sum > 0.0 {
-            edges
+            // Use regret matching
+            regrets_with_edges
                 .into_iter()
                 .map(|(edge, r)| Decision::from((edge, if r > 0.0 { r / pos_sum } else { 0.0 })))
                 .collect()
         } else {
-            // Fall back to accumulated policy σ̄
-            let weights: Vec<(Edge, f32)> = info
-                .choices()
-                .into_iter()
-                .map(|edge| {
-                    let w = self.profile.sum_policy(info, &edge);
-                    (edge, w)
-                })
-                .collect();
-            let sum_policy: f32 = weights.iter().map(|(_, w)| *w).sum();
+            // Fall back to accumulated policy σ̄ - get all policies in one batch
+            let all_policies = self.profile.get_all_policies(info);
+            
+            let mut sum_policy = 0.0f32;
+            let mut policies_with_edges = Vec::with_capacity(all_choices.len());
+            
+            for choice_edge in all_choices.iter() {
+                let policy = all_policies
+                    .iter()
+                    .find_map(|(e, p)| if e == choice_edge { Some(*p) } else { None })
+                    .unwrap_or(0.0);
+                
+                policies_with_edges.push((*choice_edge, policy));
+                sum_policy += policy;
+            }
+                
             if sum_policy > 0.0 {
-                weights
+                policies_with_edges
                     .into_iter()
                     .map(|(edge, w)| Decision::from((edge, w / sum_policy)))
                     .collect()
             } else if !self.warm_start.is_empty() {
                 self.warm_start.clone()
             } else {
-                let n = info.choices().len() as f32;
-                info.choices()
+                // Final fallback to uniform
+                let n = all_choices.len() as f32;
+                all_choices
                     .into_iter()
                     .map(|edge| Decision::from((edge, 1.0 / n)))
                     .collect()

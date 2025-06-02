@@ -1,4 +1,5 @@
 pub mod blueprint;
+pub mod compact_bucket;
 pub mod edge;
 pub mod encoder;
 pub mod game;

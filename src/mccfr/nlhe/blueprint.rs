@@ -133,39 +133,34 @@ impl Blueprint for super::solver::NLHE {
                         let bucket_mutex = profile_ref
                             .encounters
                             .entry(info)
-                            .or_insert_with(|| parking_lot::RwLock::new(smallvec::SmallVec::new()));
+                            .or_insert_with(|| parking_lot::RwLock::new(super::compact_bucket::CompactBucket::new()));
 
                         let mut bucket = bucket_mutex.value().write();
 
-                        // Search for edge record
-                        if let Some((_, entry)) = bucket.iter_mut().find(|(e, _)| *e == edge_key) {
-                            // Current values
-                            let current_policy = f32::from(entry.0);
-                            let current_regret = entry.1;
-
-                            // Discounts (cached)
-                            let discount_r = if current_regret > 0.0 {
-                                discount_pos
-                            } else if current_regret < 0.0 {
-                                discount_neg
-                            } else {
-                                discount_none
-                            };
+                        // Search for edge record and update
+                        if bucket.update_policy(edge_key, |current_policy| {
                             let discount_p = discount_none;
-
-                            // Update in-place
-                            let updated_policy = (current_policy * discount_p + delta_p).max(crate::POLICY_MIN);
-                            let updated_regret = (current_regret * discount_r + delta_r)
-                                .clamp(crate::REGRET_MIN, crate::REGRET_MAX);
-                            entry.1 = updated_regret;
-                            entry.0 = f16::from_f32(updated_policy);
+                            (current_policy * discount_p + delta_p).max(crate::POLICY_MIN)
+                        }) {
+                            // Policy was updated, now update regret
+                            bucket.update_regret(edge_key, |current_regret| {
+                                let discount_r = if current_regret > 0.0 {
+                                    discount_pos
+                                } else if current_regret < 0.0 {
+                                    discount_neg
+                                } else {
+                                    discount_none
+                                };
+                                (current_regret * discount_r + delta_r)
+                                    .clamp(crate::REGRET_MIN, crate::REGRET_MAX)
+                            });
                         } else {
                             // No existing record; create new using discounts on zero
                             let new_regret = (0.0 * discount_none + delta_r).clamp(crate::REGRET_MIN, crate::REGRET_MAX);
                             let new_policy = (0.0 * discount_none + delta_p).max(crate::POLICY_MIN);
                             #[cfg(debug_assertions)]
                             debug_assert!(
-                                bucket.iter().all(|(e, _)| *e != edge_key),
+                                bucket.iter().all(|(e, _)| e != edge_key),
                                 "duplicate edge {:?} detected in infoset {:?}",
                                 edge,
                                 info

@@ -2,6 +2,7 @@ use super::edge::Edge;
 use super::game::Game;
 use super::info::Info;
 use super::turn::Turn;
+use super::compact_bucket::CompactBucket;
 use crate::cards::street::Street;
 use crate::Arbitrary;
 use zstd::stream::Decoder as ZDecoder;
@@ -10,7 +11,6 @@ use parking_lot::RwLock;
 use crate::mccfr::types::policy::Policy;
 use crate::mccfr::types::decision::Decision;
 use crate::mccfr::traits::info::Info as InfoTrait;
-use smallvec::SmallVec;
 use std::path::PathBuf;
 use rustc_hash::FxHasher;
 use std::hash::BuildHasher;
@@ -51,7 +51,7 @@ const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
 
 // Store Edge as compact u8 key inside buckets to reduce memory footprint
 // The Edge <-> u8 bijection is already implemented via From conversions.
-type Bucket = SmallVec<[(u8, (f16, crate::Utility)); 4]>;
+type Bucket = CompactBucket;
 
 #[inline(always)]
 fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
@@ -107,7 +107,7 @@ impl Profile {
 
             // Calculate strategy entropy for this infoset
             let weights: Vec<f32> = bucket.iter()
-                .map(|(_, (policy, _))| f32::from(*policy).max(0.0))
+                .map(|(_, (policy, _))| f32::from(policy).max(0.0))
                 .collect();
             let sum: f32 = weights.iter().sum();
 
@@ -192,28 +192,28 @@ impl Profile {
             }
 
             for (_, (policy, regret)) in bucket.iter() {
-                let pol_f32 = f32::from(*policy);
+                let pol_f32 = f32::from(policy);
                 policy_min = policy_min.min(pol_f32);
                 policy_max = policy_max.max(pol_f32);
-                regret_min = regret_min.min(*regret);
-                regret_max = regret_max.max(*regret);
+                regret_min = regret_min.min(regret);
+                regret_max = regret_max.max(regret);
 
                 // Bucket regrets
-                if *regret == 0.0 {
+                if regret == 0.0 {
                     zero_regret_count += 1;
-                } else if *regret < -1_000_000.0 {
+                } else if regret < -1_000_000.0 {
                     regret_buckets[0] += 1;
-                } else if *regret < -10_000.0 {
+                } else if regret < -10_000.0 {
                     regret_buckets[1] += 1;
-                } else if *regret < -100.0 {
+                } else if regret < -100.0 {
                     regret_buckets[2] += 1;
-                } else if *regret < 0.0 {
+                } else if regret < 0.0 {
                     regret_buckets[3] += 1;
-                } else if *regret < 100.0 {
+                } else if regret < 100.0 {
                     regret_buckets[4] += 1;
-                } else if *regret < 10_000.0 {
+                } else if regret < 10_000.0 {
                     regret_buckets[5] += 1;
-                } else if *regret < 1_000_000.0 {
+                } else if regret < 1_000_000.0 {
                     regret_buckets[6] += 1;
                 } else {
                     regret_buckets[7] += 1;
@@ -303,7 +303,7 @@ impl Profile {
         let bucket_mutex = self
             .encounters
             .entry(*info)
-            .or_insert_with(|| RwLock::new(SmallVec::new()));
+            .or_insert_with(|| RwLock::new(CompactBucket::new()));
         let mut bucket = bucket_mutex.value().write();
         // Normalise weights to sum to 1.
         let total: f32 = decisions.iter().map(|d| d.weight()).sum();
@@ -322,16 +322,15 @@ impl Profile {
             let bucket_mutex = self
                 .encounters
                 .entry(info)
-                .or_insert_with(|| RwLock::new(SmallVec::new()));
+                .or_insert_with(|| RwLock::new(CompactBucket::new()));
             let mut bucket = bucket_mutex.value().write();
             // Update regrets
             for (edge, delta) in regret_vec {
                 let edge_key = u8::from(edge);
-                if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge_key) {
-                    let new_regret = existing.1 .1 + delta;
-                    existing.1 .1 = self::safe_clamp(new_regret, current_min, current_max);
-                } else {
-                    // Check delta for NaN before storing
+                if !bucket.update_regret(edge_key, |old_regret| {
+                    self::safe_clamp(old_regret + delta, current_min, current_max)
+                }) {
+                    // Edge doesn't exist, add new entry
                     let safe_delta = self::safe_clamp(delta, current_min, current_max);
                     bucket.push((edge_key, (f16::from_f32(0.0), safe_delta)));
                 }
@@ -339,24 +338,90 @@ impl Profile {
             // Update policies
             for (edge, delta) in policy_vec {
                 let edge_key = u8::from(edge);
-                if let Some(existing) = bucket.iter_mut().find(|(e, _)| *e == edge_key) {
-                    let prev = f32::from(existing.1 .0);
-                    let new_policy = prev + delta;
-
+                if !bucket.update_policy(edge_key, |old_policy| {
+                    let new_policy = old_policy + delta;
                     // Fast check for invalid values
                     if new_policy.is_nan() || new_policy < 0.0 {
-                        existing.1 .0 = f16::from_f32(crate::POLICY_MIN);
+                        crate::POLICY_MIN
                     } else {
-                        existing.1 .0 = f16::from_f32(new_policy);
+                        new_policy
                     }
-                } else {
-                    // Check delta for validity before storing
+                }) {
+                    // Edge doesn't exist, add new entry
                     let safe_delta = if delta.is_nan() || delta < 0.0 { crate::POLICY_MIN } else { delta };
                     bucket.push((edge_key, (f16::from_f32(safe_delta), 0.0)));
                 }
             }
         }
     }
+
+    /// Fetch all regrets for an infoset in a single DashMap access.
+    /// Returns pairs of (edge, regret) for all edges in the bucket.
+    fn get_all_regrets(&self, info: &Info) -> Vec<(Edge, f32)> {
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
+            let mut result = Vec::with_capacity(bucket.len());
+            
+            for (edge_u8, (_, regret)) in bucket.iter() {
+                // Convert u8 back to Edge
+                let edge = Edge::from(edge_u8);
+                result.push((edge, regret));
+            }
+            result
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Fetch all policies for an infoset in a single DashMap access.
+    /// Returns pairs of (edge, policy) for all edges in the bucket.
+    fn get_all_policies(&self, info: &Info) -> Vec<(Edge, f32)> {
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
+            let mut result = Vec::with_capacity(bucket.len());
+            
+            for (edge_u8, (policy, _)) in bucket.iter() {
+                // Convert u8 back to Edge and f16 to f32
+                let edge = Edge::from(edge_u8);
+                let policy_f32 = f32::from(policy);
+                result.push((edge, policy_f32));
+            }
+            result
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Compute the entire policy distribution for an infoset using regret matching.
+    /// This does a single DashMap lookup and returns normalized probabilities for all edges.
+    fn policy_distribution(&self, info: &Info) -> Policy<Edge> {
+        let all_regrets = self.get_all_regrets(info);
+        let all_choices = info.choices();
+        
+        // Single pass: compute sum while building result
+        let mut sum = 0.0f32;
+        let mut result = Vec::with_capacity(all_choices.len());
+        
+        for choice_edge in all_choices {
+            let regret = all_regrets
+                .iter()
+                .find(|(e, _)| e == &choice_edge)
+                .map(|(_, r)| *r)
+                .unwrap_or(0.0)
+                .max(crate::POLICY_MIN);
+            
+            sum += regret;
+            result.push((choice_edge, regret));
+        }
+        
+        // Normalize in-place
+        for (_, prob) in result.iter_mut() {
+            *prob /= sum;
+        }
+        
+        result.into_iter().collect()
+    }
+
 }
 
 impl crate::mccfr::traits::profile::Profile for Profile {
@@ -377,23 +442,26 @@ impl crate::mccfr::traits::profile::Profile for Profile {
     fn epochs(&self) -> usize {
         self.iterations
     }
+    
+    // Keep the single-edge lookups for when we truly need just one value
     fn sum_policy(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
         if let Some(bucket_mutex) = self.encounters.get(info) {
             let bucket = bucket_mutex.value().read();
             bucket
                 .iter()
-                .find_map(|(e, (p, _))| if *e == u8::from(*edge) { Some(f32::from(*p)) } else { None })
+                .find_map(|(e, (p, _))| if e == u8::from(*edge) { Some(f32::from(p)) } else { None })
                 .unwrap_or_default()
         } else {
             0.0
         }
     }
+    
     fn sum_regret(&self, info: &Self::I, edge: &Self::E) -> crate::Utility {
         let regret_val = if let Some(bucket_mutex) = self.encounters.get(info) {
             let bucket = bucket_mutex.value().read();
             bucket
                 .iter()
-                .find_map(|(e, (_, r))| if *e == u8::from(*edge) { Some(*r) } else { None })
+                .find_map(|(e, (_, r))| if e == u8::from(*edge) { Some(r) } else { None })
                 .unwrap_or_default()
         } else {
             0.0
@@ -407,6 +475,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             regret_val
         }
     }
+    
     fn current_regret_min(&self) -> crate::Utility {
         self.regret_min
     }
@@ -414,43 +483,88 @@ impl crate::mccfr::traits::profile::Profile for Profile {
         self.regret_max
     }
 
-    // -------------------------------------------------------------------
-    // Optimized policy_vector: cache bucket map once per infoset to avoid
-    // repeated DashMap lookups and mutex locking for each edge.
-    // -------------------------------------------------------------------
+    // Override the default policy() method to use batch access
+    fn policy(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
+        let all_choices = info.choices();
+        if all_choices.is_empty() {
+            return 0.0;
+        }
+        
+        // Get all regrets in one DashMap access
+        let all_regrets = self.get_all_regrets(info);
+        
+        // For poker's small edge counts (81% have ≤4, 100% have ≤13),
+        // linear search is faster than HashMap construction
+        let mut sum = 0.0;
+        let mut edge_regret = 0.0;
+        
+        // Single pass through choices
+        for choice_edge in &all_choices {
+            // Linear search through stored values (typically 2-8 items)
+            let regret = all_regrets
+                .iter()
+                .find(|(e, _)| e == choice_edge)
+                .map(|(_, r)| *r)
+                .unwrap_or(0.0)
+                .max(crate::POLICY_MIN);
+            
+            sum += regret;
+            if choice_edge == edge {
+                edge_regret = regret;
+            }
+        }
+        
+        edge_regret / sum
+    }
+
+    // Override the default advice() method to use batch access
+    fn advice(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
+        let all_choices = info.choices();
+        if all_choices.is_empty() {
+            return 0.0;
+        }
+        
+        // Get all policies in one DashMap access
+        let all_policies = self.get_all_policies(info);
+        
+        // For poker's small edge counts (81% have ≤4, 100% have ≤13),
+        // linear search is faster than HashMap construction
+        let mut sum = 0.0;
+        let mut edge_policy = 0.0;
+        
+        // Single pass through choices
+        for choice_edge in &all_choices {
+            // Linear search through stored values (typically 2-8 items)
+            let policy = all_policies
+                .iter()
+                .find(|(e, _)| e == choice_edge)
+                .map(|(_, p)| *p)
+                .unwrap_or(0.0)
+                .max(crate::POLICY_MIN);
+            
+            sum += policy;
+            if choice_edge == edge {
+                edge_policy = policy;
+            }
+        }
+        
+        edge_policy / sum
+    }
+
+    // The already-optimized policy_vector stays mostly the same, 
+    // but we can make it even cleaner now
     fn policy_vector(
         &self,
         infoset: &crate::mccfr::structs::infoset::InfoSet<Self::T, Self::E, Self::G, Self::I>,
     ) -> crate::mccfr::types::policy::Policy<Self::E> {
         let info = infoset.info();
-
-        let choices_vec = info.choices();
-        let mut small: SmallVec<[(Self::E, f32); 8]> = SmallVec::with_capacity(choices_vec.len().min(8));
-
-        if let Some(bucket_mutex) = self.encounters.get(&info) {
-            let bucket = bucket_mutex.value().read();
-            for edge in choices_vec.iter().copied() {
-                let regret_raw = bucket
-                    .iter()
-                    .find_map(|(e, (_, r))| if *e == u8::from(edge) { Some(*r) } else { None })
-                    .unwrap_or_default();
-                small.push((edge, regret_raw.max(crate::POLICY_MIN)));
-            }
-        } else {
-            for edge in choices_vec.iter().copied() {
-                small.push((edge, crate::POLICY_MIN));
-            }
-        }
-
-        let mut regrets_vec: Policy<Self::E> = small.into_vec();
-        let denominator: crate::Utility = regrets_vec.iter().map(|(_, r)| r).sum();
-        regrets_vec
-            .iter_mut()
-            .for_each(|(_, r)| *r /= denominator);
-        regrets_vec
-            .into_iter()
-            .collect()
+        
+        // Use the new batch method to get the entire distribution at once
+        self.policy_distribution(&info)
     }
+
+    // Note: regret_vector will automatically benefit from our optimized policy() method
+    // which now uses batch access instead of individual lookups
 }
 
 #[cfg(feature = "native")]
@@ -574,7 +688,7 @@ impl Profile {
             let bucket_mutex = self
                 .encounters
                 .entry(info)
-                .or_insert_with(|| RwLock::new(SmallVec::new()));
+                .or_insert_with(|| RwLock::new(CompactBucket::new()));
             let mut bucket = bucket_mutex.value().write();
             for _ in 0..edges_per_bucket {
                 let edge = Edge::random();
@@ -664,13 +778,13 @@ impl Profile {
             let edges_vec = bucket_entry.value().read();
 
             for (edge, (policy, regret)) in edges_vec.iter() {
-                let edge_enum: Edge = (*edge).into();
+                let edge_enum: Edge = edge.into();
                 chunk_histories.push(u64::from(*bucket.history()) as i64);
                 chunk_presents.push(u64::from(*bucket.present()) as i64);
                 chunk_futures.push(u64::from(*bucket.futures()) as i64);
                 chunk_edges.push(u64::from(edge_enum) as u32); // Edge values must fit in u32
-                chunk_regrets.push(*regret);
-                chunk_policies.push(f32::from(*policy));
+                chunk_regrets.push(regret);
+                chunk_policies.push(f32::from(policy));
 
                 _written_records += 1;
                 progress.inc(1);
@@ -862,7 +976,7 @@ impl Profile {
                                 let info = Info::from((history, present, futures));
                                 let bucket_mutex = encounters
                                     .entry(info)
-                                    .or_insert_with(|| RwLock::new(SmallVec::new()));
+                                    .or_insert_with(|| RwLock::new(CompactBucket::new()));
                                 bucket_mutex
                                     .value()
                                     .write()
@@ -954,7 +1068,7 @@ impl Profile {
             let info = Info::from((history, present, futures));
             let bucket_mutex = encounters
                 .entry(info)
-                .or_insert_with(|| RwLock::new(SmallVec::new()));
+                .or_insert_with(|| RwLock::new(CompactBucket::new()));
             let mut bucket = bucket_mutex.value().write();
             bucket.push((u8::from(edge), (f16::from_f32(policy), regret)));
         }
