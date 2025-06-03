@@ -932,12 +932,12 @@ impl Profile {
             std::fs::create_dir_all(parent).expect("Failed to create parent directories");
         }
 
-        // Calculate total records
+        // Calculate total records first
         let total_records: usize = self.encounters.iter()
             .map(|entry| entry.value().read().len())
             .sum();
 
-                log::info!("Saving blueprint to {} ({} records)", path_str, total_records);
+        log::info!("Saving blueprint to {} ({} records)", path_str, total_records);
 
         let progress = crate::progress(total_records);
         progress.set_message("Saving blueprint to parquet");
@@ -952,7 +952,7 @@ impl Profile {
             Field::new("policy", DataType::Float32, false),
         ]);
 
-        // Define encodings
+                // Define encodings - use plain encoding to minimize memory usage
         let encodings = vec![
             vec![Encoding::Plain],      // history
             vec![Encoding::Plain],      // present
@@ -962,23 +962,22 @@ impl Profile {
             vec![Encoding::Plain],      // policy
         ];
 
-        // Write options - optimized for speed
+        // Write options - optimized for speed while keeping compression
         let options = WriteOptions {
             write_statistics: true, // Keep statistics for better query performance
             compression: CompressionOptions::Zstd(Some(arrow2::io::parquet::write::ZstdLevel::try_new(1).unwrap())), // Fast ZSTD compression level 1
             version: Version::V2,
-            data_pagesize_limit: Some(1024 * 1024), // Larger 1MB pages for better throughput
+            data_pagesize_limit: Some(2 * 1024 * 1024), // 2MB pages for good balance
         };
 
-        // Create output file and writer
+        // Create output file and writer with reasonable buffer
         let file = File::create(path).expect(&format!("Failed to create file at {}", path_str));
-        let writer_inner = BufWriter::with_capacity(8 * 1024 * 1024, file); // 8MB buffer
+        let writer_inner = BufWriter::with_capacity(16 * 1024 * 1024, file); // 16MB buffer
         let mut writer = FileWriter::try_new(writer_inner, schema.clone(), options)
             .expect("Failed to create parquet writer");
 
-        // Stream data in chunks to avoid doubling memory usage
-        const RECORDS_PER_CHUNK: usize = 1_000_000; // Process 1M records at a time
-        let mut _written_records = 0;
+        const RECORDS_PER_CHUNK: usize = 5_000_000; // 3M records per chunk
+        let mut written_records = 0;
 
         let mut chunk_histories = Vec::with_capacity(RECORDS_PER_CHUNK);
         let mut chunk_presents = Vec::with_capacity(RECORDS_PER_CHUNK);
@@ -996,12 +995,16 @@ impl Profile {
                 chunk_histories.push(u64::from(*bucket.history()) as i64);
                 chunk_presents.push(u64::from(*bucket.present()) as i64);
                 chunk_futures.push(u64::from(*bucket.futures()) as i64);
-                chunk_edges.push(u64::from(edge_enum) as u32); // Edge values must fit in u32
+                chunk_edges.push(u64::from(edge_enum) as u32);
                 chunk_regrets.push(regret);
                 chunk_policies.push(f32::from(policy));
 
-                _written_records += 1;
-                progress.inc(1);
+                written_records += 1;
+
+                // Update progress less frequently to reduce overhead
+                if written_records % 1_000_000 == 0 {
+                    progress.set_position(written_records as u64);
+                }
 
                 // Write chunk when it's full
                 if chunk_histories.len() >= RECORDS_PER_CHUNK {
@@ -1018,13 +1021,14 @@ impl Profile {
                         &chunk_policies,
                     );
 
-                    // Clear chunks for next batch
+                    // Reuse vectors instead of reallocating - just reset length
                     chunk_histories.clear();
                     chunk_presents.clear();
                     chunk_futures.clear();
                     chunk_edges.clear();
                     chunk_regrets.clear();
                     chunk_policies.clear();
+
                 }
             }
         }
@@ -1300,6 +1304,8 @@ impl Profile {
 
         profile
     }
+
+
 }
 
 /// Custom BuildHasher for FxHasher

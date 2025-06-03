@@ -58,11 +58,11 @@ mod kmeans_constants {
 
 #[cfg(feature = "shortdeck")]
 mod kmeans_constants {
-    pub const KMEANS_FLOP_TRAINING_ITERATIONS: usize = 10;
-    pub const KMEANS_TURN_TRAINING_ITERATIONS: usize = 12;
-    pub const KMEANS_FLOP_CLUSTER_COUNT: usize = 32;
-    pub const KMEANS_TURN_CLUSTER_COUNT: usize = 48;
-    pub const KMEANS_EQTY_CLUSTER_COUNT: usize = 51;
+    pub const KMEANS_FLOP_TRAINING_ITERATIONS: usize = 20;
+    pub const KMEANS_TURN_TRAINING_ITERATIONS: usize = 24;
+    pub const KMEANS_FLOP_CLUSTER_COUNT: usize = 96;
+    pub const KMEANS_TURN_CLUSTER_COUNT: usize = 96;
+    pub const KMEANS_EQTY_CLUSTER_COUNT: usize = 96;
 }
 
 use kmeans_constants::*;
@@ -75,7 +75,7 @@ const CFR_TREE_COUNT_RPS: usize = 8192;
 
 /// checkpointing interval (in hours) for periodic profile saves during training
 #[cfg(feature = "native")]
-pub const CHECKPOINT_HOURS: u64 = 6;
+pub const CHECKPOINT_HOURS: u64 = 8;
 
 // nlhe mccfr parameters
 const CFR_BATCH_SIZE_NLHE: usize = 1024;

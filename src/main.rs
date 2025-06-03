@@ -5,7 +5,7 @@ use robopokerlib::*;
 // This provides better memory efficiency and performance for applications
 // with many small allocations, like MCCFR with billions of infosets
 #[cfg(all(feature = "native", not(target_env = "msvc")))]
-use jemallocator::Jemalloc;
+use tikv_jemallocator::Jemalloc;
 
 #[cfg(all(feature = "native", not(target_env = "msvc")))]
 #[global_allocator]
