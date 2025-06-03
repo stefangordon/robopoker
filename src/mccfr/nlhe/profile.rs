@@ -355,71 +355,105 @@ impl Profile {
         }
     }
 
-    /// Fetch all regrets for an infoset in a single DashMap access.
-    /// Returns pairs of (edge, regret) for all edges in the bucket.
-    fn get_all_regrets(&self, info: &Info) -> Vec<(Edge, f32)> {
-        if let Some(bucket_mutex) = self.encounters.get(info) {
-            let bucket = bucket_mutex.value().read();
-            let mut result = Vec::with_capacity(bucket.len());
-            
-            for (edge_u8, (_, regret)) in bucket.iter() {
-                // Convert u8 back to Edge
-                let edge = Edge::from(edge_u8);
-                result.push((edge, regret));
-            }
-            result
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Fetch all policies for an infoset in a single DashMap access.
-    /// Returns pairs of (edge, policy) for all edges in the bucket.
-    fn get_all_policies(&self, info: &Info) -> Vec<(Edge, f32)> {
-        if let Some(bucket_mutex) = self.encounters.get(info) {
-            let bucket = bucket_mutex.value().read();
-            let mut result = Vec::with_capacity(bucket.len());
-            
-            for (edge_u8, (policy, _)) in bucket.iter() {
-                // Convert u8 back to Edge and f16 to f32
-                let edge = Edge::from(edge_u8);
-                let policy_f32 = f32::from(policy);
-                result.push((edge, policy_f32));
-            }
-            result
-        } else {
-            Vec::new()
-        }
-    }
-
     /// Compute the entire policy distribution for an infoset using regret matching.
     /// This does a single DashMap lookup and returns normalized probabilities for all edges.
     fn policy_distribution(&self, info: &Info) -> Policy<Edge> {
-        let all_regrets = self.get_all_regrets(info);
         let all_choices = info.choices();
-        
-        // Single pass: compute sum while building result
-        let mut sum = 0.0f32;
-        let mut result = Vec::with_capacity(all_choices.len());
-        
-        for choice_edge in all_choices {
-            let regret = all_regrets
-                .iter()
-                .find(|(e, _)| e == &choice_edge)
-                .map(|(_, r)| *r)
-                .unwrap_or(0.0)
-                .max(crate::POLICY_MIN);
-            
-            sum += regret;
-            result.push((choice_edge, regret));
+        if all_choices.is_empty() {
+            return Policy::new();
         }
-        
-        // Normalize in-place
-        for (_, prob) in result.iter_mut() {
-            *prob /= sum;
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
+
+            // Build choice map for O(1) lookups
+            let mut choice_map = [0xff_u8; 256];
+            for (i, &choice) in all_choices.iter().enumerate() {
+                choice_map[u8::from(choice) as usize] = i as u8;
+            }
+
+            // Use stack allocation for small edge counts
+            let mut regrets = [crate::POLICY_MIN; 13];
+
+            // Single pass through bucket to gather regrets
+            for (edge_u8, (_, regret)) in bucket.iter() {
+                let choice_idx = choice_map[edge_u8 as usize];
+                if choice_idx != 0xff {
+                    regrets[choice_idx as usize] = regret.max(crate::POLICY_MIN);
+                }
+            }
+
+            // Compute sum and normalize
+            let sum: f32 = regrets[..all_choices.len()].iter().sum();
+
+            // Build result with normalization
+            all_choices.iter()
+                .enumerate()
+                .map(|(i, &edge)| (edge, regrets[i] / sum))
+                .collect()
+        } else {
+            // No data: uniform distribution
+            let prob = 1.0 / all_choices.len() as f32;
+            all_choices.into_iter().map(|edge| (edge, prob)).collect()
         }
-        
-        result.into_iter().collect()
+    }
+
+    /// Compute sampling probabilities for all edges in an infoset efficiently.
+    /// This does a single DashMap lookup and returns sampling weights for all edges.
+    /// Used by MCCFR external sampling to select actions during tree traversal.
+    fn sample_distribution(&self, info: &Info) -> Policy<Edge> {
+        let all_choices = info.choices();
+        if all_choices.is_empty() {
+            return Policy::new();
+        }
+
+        // Constants for sampling formula
+        let activation = crate::SAMPLING_ACTIVATION;
+        let threshold = crate::SAMPLING_THRESHOLD;
+        let exploration = crate::SAMPLING_EXPLORATION;
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
+
+            // Build choice map for O(1) lookups
+            let mut choice_map = [0xff_u8; 256];
+            for (i, &choice) in all_choices.iter().enumerate() {
+                choice_map[u8::from(choice) as usize] = i as u8;
+            }
+
+            // Use stack allocation for small edge counts
+            let mut policies = [0.0f32; 13];
+
+            // Single pass through bucket to gather policies
+            for (edge_u8, (policy, _)) in bucket.iter() {
+                let choice_idx = choice_map[edge_u8 as usize];
+                if choice_idx != 0xff {
+                    policies[choice_idx as usize] = f32::from(policy).max(crate::POLICY_MIN);
+                }
+            }
+
+            // Apply sampling formula: q(a) = max(ε, (β + τ * weight(a)) / (β + sum(weights)))
+            let sum: f32 = policies[..all_choices.len()].iter().sum();
+            let denom = activation + sum;
+
+            // Build result with sampling probabilities
+            all_choices.iter()
+                .enumerate()
+                .map(|(i, &edge)| {
+                    let numer = activation + policies[i] * threshold;
+                    let sample_prob = (numer / denom).max(exploration);
+                    (edge, sample_prob)
+                })
+                .collect()
+        } else {
+            // No data: all policies are POLICY_MIN
+            let n = all_choices.len() as f32;
+            let sum = n * crate::POLICY_MIN;
+            let denom = activation + sum;
+            let numer = activation + crate::POLICY_MIN * threshold;
+            let uniform_prob = (numer / denom).max(exploration);
+            all_choices.into_iter().map(|edge| (edge, uniform_prob)).collect()
+        }
     }
 
 }
@@ -442,7 +476,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
     fn epochs(&self) -> usize {
         self.iterations
     }
-    
+
     // Keep the single-edge lookups for when we truly need just one value
     fn sum_policy(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
         if let Some(bucket_mutex) = self.encounters.get(info) {
@@ -455,7 +489,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             0.0
         }
     }
-    
+
     fn sum_regret(&self, info: &Self::I, edge: &Self::E) -> crate::Utility {
         let regret_val = if let Some(bucket_mutex) = self.encounters.get(info) {
             let bucket = bucket_mutex.value().read();
@@ -475,7 +509,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             regret_val
         }
     }
-    
+
     fn current_regret_min(&self) -> crate::Utility {
         self.regret_min
     }
@@ -483,88 +517,267 @@ impl crate::mccfr::traits::profile::Profile for Profile {
         self.regret_max
     }
 
-    // Override the default policy() method to use batch access
+    // Override the default policy() method to use direct bucket access
     fn policy(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
         let all_choices = info.choices();
         if all_choices.is_empty() {
             return 0.0;
         }
-        
-        // Get all regrets in one DashMap access
-        let all_regrets = self.get_all_regrets(info);
-        
-        // For poker's small edge counts (81% have ≤4, 100% have ≤13),
-        // linear search is faster than HashMap construction
-        let mut sum = 0.0;
-        let mut edge_regret = 0.0;
-        
-        // Single pass through choices
-        for choice_edge in &all_choices {
-            // Linear search through stored values (typically 2-8 items)
-            let regret = all_regrets
-                .iter()
-                .find(|(e, _)| e == choice_edge)
-                .map(|(_, r)| *r)
-                .unwrap_or(0.0)
-                .max(crate::POLICY_MIN);
-            
-            sum += regret;
-            if choice_edge == edge {
-                edge_regret = regret;
+
+        // Early check if edge is in choices and build lookup map
+        let mut choice_map = [0xff_u8; 256];
+        let mut target_idx = 0xff_u8;
+        for (i, &choice) in all_choices.iter().enumerate() {
+            choice_map[u8::from(choice) as usize] = i as u8;
+            if choice == *edge {
+                target_idx = i as u8;
             }
         }
-        
-        edge_regret / sum
+
+        if target_idx == 0xff {
+            return 0.0; // Edge not in choices
+        }
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
+
+            let mut sum = 0.0f32;
+            let mut target_regret = crate::POLICY_MIN;
+            let mut found_mask = 0u16;
+
+            // Single pass through bucket
+            for (edge_u8, (_, regret)) in bucket.iter() {
+                let choice_idx = choice_map[edge_u8 as usize];
+                if choice_idx != 0xff {
+                    let r = regret.max(crate::POLICY_MIN);
+                    sum += r;
+                    if choice_idx == target_idx {
+                        target_regret = r;
+                    }
+                    found_mask |= 1 << choice_idx;
+                }
+            }
+
+            // Add defaults for missing edges
+            let missing_count = all_choices.len() - found_mask.count_ones() as usize;
+            sum += missing_count as f32 * crate::POLICY_MIN;
+
+            target_regret / sum
+        } else {
+            // No data: uniform distribution
+            1.0 / all_choices.len() as f32
+        }
     }
 
-    // Override the default advice() method to use batch access
+    // Override the default advice() method to use direct bucket access
     fn advice(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
         let all_choices = info.choices();
         if all_choices.is_empty() {
             return 0.0;
         }
-        
-        // Get all policies in one DashMap access
-        let all_policies = self.get_all_policies(info);
-        
-        // For poker's small edge counts (81% have ≤4, 100% have ≤13),
-        // linear search is faster than HashMap construction
-        let mut sum = 0.0;
-        let mut edge_policy = 0.0;
-        
-        // Single pass through choices
-        for choice_edge in &all_choices {
-            // Linear search through stored values (typically 2-8 items)
-            let policy = all_policies
-                .iter()
-                .find(|(e, _)| e == choice_edge)
-                .map(|(_, p)| *p)
-                .unwrap_or(0.0)
-                .max(crate::POLICY_MIN);
-            
-            sum += policy;
-            if choice_edge == edge {
-                edge_policy = policy;
+
+        // Early check if edge is in choices and build lookup map
+        let mut choice_map = [0xff_u8; 256];
+        let mut target_idx = 0xff_u8;
+        for (i, &choice) in all_choices.iter().enumerate() {
+            choice_map[u8::from(choice) as usize] = i as u8;
+            if choice == *edge {
+                target_idx = i as u8;
             }
         }
-        
-        edge_policy / sum
+
+        if target_idx == 0xff {
+            return 0.0; // Edge not in choices
+        }
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
+
+            let mut sum = 0.0f32;
+            let mut target_policy = crate::POLICY_MIN;
+            let mut found_mask = 0u16;
+
+            // Single pass through bucket
+            for (edge_u8, (policy, _)) in bucket.iter() {
+                let choice_idx = choice_map[edge_u8 as usize];
+                if choice_idx != 0xff {
+                    let p = f32::from(policy).max(crate::POLICY_MIN);
+                    sum += p;
+                    if choice_idx == target_idx {
+                        target_policy = p;
+                    }
+                    found_mask |= 1 << choice_idx;
+                }
+            }
+
+            // Add defaults for missing edges
+            let missing_count = all_choices.len() - found_mask.count_ones() as usize;
+            sum += missing_count as f32 * crate::POLICY_MIN;
+
+            target_policy / sum
+        } else {
+            // No data: uniform distribution
+            1.0 / all_choices.len() as f32
+        }
     }
 
-    // The already-optimized policy_vector stays mostly the same, 
+    // Override the sample() method to use batch access
+    fn sample(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
+        let all_choices = info.choices();
+        if all_choices.is_empty() {
+            return 0.0;
+        }
+
+        // Early check if edge is in choices
+        let target_idx = match all_choices.iter().position(|&e| e == *edge) {
+            Some(idx) => idx,
+            None => return 0.0,
+        };
+
+        // Constants for sampling formula
+        let activation = crate::SAMPLING_ACTIVATION;
+        let threshold = crate::SAMPLING_THRESHOLD;
+        let exploration = crate::SAMPLING_EXPLORATION;
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
+
+            // Build choice map for O(1) lookups
+            let mut choice_map = [0xff_u8; 256];
+            for (i, &choice) in all_choices.iter().enumerate() {
+                choice_map[u8::from(choice) as usize] = i as u8;
+            }
+
+            // Direct computation without intermediate storage
+            let mut sum = 0.0f32;
+            let mut target_policy = 0.0f32;
+            let mut found_mask = 0u16;
+
+            // Single pass through bucket
+            for (edge_u8, (policy, _)) in bucket.iter() {
+                let choice_idx = choice_map[edge_u8 as usize];
+                if choice_idx != 0xff {
+                    let p = f32::from(policy).max(crate::POLICY_MIN);
+                    sum += p;
+                    if choice_idx as usize == target_idx {
+                        target_policy = p;
+                    }
+                    found_mask |= 1 << choice_idx;
+                }
+            }
+
+            // Add defaults for missing edges (but not to target if it wasn't found)
+            let was_target_found = (found_mask & (1 << target_idx)) != 0;
+            if !was_target_found {
+                target_policy = crate::POLICY_MIN;
+            }
+            let missing_count = all_choices.len() - found_mask.count_ones() as usize;
+            sum += missing_count as f32 * crate::POLICY_MIN;
+
+            // Apply sampling formula: q(a) = max(ε, (β + τ * weight(a)) / (β + sum(weights)))
+            let denom = activation + sum;
+            let numer = activation + target_policy * threshold;
+            (numer / denom).max(exploration)
+        } else {
+            // No data: all policies are POLICY_MIN
+            let n = all_choices.len() as f32;
+            let sum = n * crate::POLICY_MIN;
+            let target_policy = crate::POLICY_MIN;
+            let denom = activation + sum;
+            let numer = activation + target_policy * threshold;
+            (numer / denom).max(exploration)
+        }
+    }
+
+    // The already-optimized policy_vector stays mostly the same,
     // but we can make it even cleaner now
     fn policy_vector(
         &self,
         infoset: &crate::mccfr::structs::infoset::InfoSet<Self::T, Self::E, Self::G, Self::I>,
     ) -> crate::mccfr::types::policy::Policy<Self::E> {
         let info = infoset.info();
-        
+
         // Use the new batch method to get the entire distribution at once
         self.policy_distribution(&info)
     }
 
     // Note: regret_vector will automatically benefit from our optimized policy() method
     // which now uses batch access instead of individual lookups
+
+    // Override explore_one to use batch sampling with a single DashMap lookup
+    fn explore_one(
+        &self,
+        node: &crate::mccfr::structs::node::Node<Self::T, Self::E, Self::G, Self::I>,
+        branches: Vec<crate::mccfr::types::branch::Branch<Self::E, Self::G>>,
+    ) -> Vec<crate::mccfr::types::branch::Branch<Self::E, Self::G>> {
+        use rand::distributions::WeightedIndex;
+        use rand::prelude::Distribution;
+
+        let info = node.info();
+        let mut choices = branches;
+
+        if choices.is_empty() {
+            return choices;
+        }
+
+        // Constants for sampling formula
+        let activation = crate::SAMPLING_ACTIVATION;
+        let threshold = crate::SAMPLING_THRESHOLD;
+        let exploration = crate::SAMPLING_EXPLORATION;
+
+        // Compute weights with a single DashMap lookup
+        let weights: Vec<f32> = if let Some(bucket_mutex) = self.encounters.get(&info) {
+            let bucket = bucket_mutex.value().read();
+
+            // Build edge to policy map
+            let mut edge_policies = [0.0f32; 256]; // indexed by edge u8 value
+            let mut total_policy = 0.0f32;
+
+            for (edge_u8, (policy, _)) in bucket.iter() {
+                let p = f32::from(policy).max(crate::POLICY_MIN);
+                edge_policies[edge_u8 as usize] = p;
+                total_policy += p;
+            }
+
+            // Also count edges not in bucket
+            let all_choices = info.choices();
+            for edge in &all_choices {
+                let edge_u8 = u8::from(*edge);
+                if edge_policies[edge_u8 as usize] == 0.0 {
+                    edge_policies[edge_u8 as usize] = crate::POLICY_MIN;
+                    total_policy += crate::POLICY_MIN;
+                }
+            }
+
+            // Apply sampling formula to each branch
+            let denom = activation + total_policy;
+            choices
+                .iter()
+                .map(|(edge, _, _)| {
+                    let edge_u8 = u8::from(*edge);
+                    let policy = edge_policies[edge_u8 as usize];
+                    let numer = activation + policy * threshold;
+                    (numer / denom).max(exploration)
+                })
+                .collect()
+        } else {
+            // No data: all policies are POLICY_MIN
+            let n = info.choices().len() as f32;
+            let sum = n * crate::POLICY_MIN;
+            let denom = activation + sum;
+            let numer = activation + crate::POLICY_MIN * threshold;
+            let uniform_prob = (numer / denom).max(exploration);
+            vec![uniform_prob; choices.len()]
+        };
+
+        // Sample according to weights
+        let ref mut rng = self.rng(&info);
+        let choice = WeightedIndex::new(weights)
+            .expect("at least one weight > 0")
+            .sample(rng);
+        let chosen = choices.remove(choice);
+        vec![chosen]
+    }
 }
 
 #[cfg(feature = "native")]
@@ -1155,3 +1368,4 @@ impl ProfileBuilder {
         (profile, warm_start)
     }
 }
+
