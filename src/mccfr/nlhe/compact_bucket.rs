@@ -56,7 +56,10 @@ impl LargeBucket {
 
     fn get(&self, index: usize) -> Option<(u8, (f16, f32))> {
         if index < self.edges.len() {
-            Some((self.edges[index], (self.policies[index], self.regrets[index])))
+            Some((
+                self.edges[index],
+                (self.policies[index], self.regrets[index]),
+            ))
         } else {
             None
         }
@@ -72,7 +75,7 @@ impl CompactBucket {
                 edges: [0; 4],
                 policies: [f16::from_f32(0.0); 4],
                 regrets: [0.0; 4],
-            }
+            },
         }
     }
 
@@ -91,7 +94,12 @@ impl CompactBucket {
     pub fn push(&mut self, entry: (u8, (f16, f32))) {
         let (edge, (policy, regret)) = entry;
         match &mut self.inner {
-            CompactBucketInner::Small { count, edges, policies, regrets } => {
+            CompactBucketInner::Small {
+                count,
+                edges,
+                policies,
+                regrets,
+            } => {
                 // Check if edge already exists
                 for i in 0..*count as usize {
                     if edges[i] == edge {
@@ -175,7 +183,12 @@ impl CompactBucket {
     /// Find entry by edge (commonly used pattern)
     pub fn find_by_edge(&self, edge: u8) -> Option<(f16, f32)> {
         match &self.inner {
-            CompactBucketInner::Small { count, edges, policies, regrets } => {
+            CompactBucketInner::Small {
+                count,
+                edges,
+                policies,
+                regrets,
+            } => {
                 // Unrolled for common cases
                 let count = *count as usize;
                 if count > 0 && edges[0] == edge {
@@ -205,9 +218,7 @@ impl CompactBucket {
 
     /// Get regret for edge (returns 0.0 if not found)
     pub fn get_regret(&self, edge: u8) -> f32 {
-        self.find_by_edge(edge)
-            .map(|(_, r)| r)
-            .unwrap_or(0.0)
+        self.find_by_edge(edge).map(|(_, r)| r).unwrap_or(0.0)
     }
 
     /// Update or insert the regret for an edge
@@ -216,7 +227,12 @@ impl CompactBucket {
         F: FnOnce(f32) -> f32,
     {
         match &mut self.inner {
-            CompactBucketInner::Small { count, edges, policies: _, regrets } => {
+            CompactBucketInner::Small {
+                count,
+                edges,
+                policies: _,
+                regrets,
+            } => {
                 let count_val = *count as usize;
                 for i in 0..count_val {
                     if edges[i] == edge {
@@ -243,7 +259,12 @@ impl CompactBucket {
         F: FnOnce(f32) -> f32,
     {
         match &mut self.inner {
-            CompactBucketInner::Small { count, edges, policies, regrets: _ } => {
+            CompactBucketInner::Small {
+                count,
+                edges,
+                policies,
+                regrets: _,
+            } => {
                 let count_val = *count as usize;
                 for i in 0..count_val {
                     if edges[i] == edge {
@@ -276,20 +297,25 @@ impl Default for CompactBucket {
 impl Clone for CompactBucket {
     fn clone(&self) -> Self {
         match &self.inner {
-            CompactBucketInner::Small { count, edges, policies, regrets } => Self {
+            CompactBucketInner::Small {
+                count,
+                edges,
+                policies,
+                regrets,
+            } => Self {
                 inner: CompactBucketInner::Small {
                     count: *count,
                     edges: *edges,
                     policies: *policies,
                     regrets: *regrets,
-                }
+                },
             },
             CompactBucketInner::Large(bucket) => Self {
                 inner: CompactBucketInner::Large(Box::new(LargeBucket {
                     edges: bucket.edges.clone(),
                     policies: bucket.policies.clone(),
                     regrets: bucket.regrets.clone(),
-                }))
+                })),
             },
         }
     }
@@ -306,7 +332,12 @@ impl<'a> Iterator for BucketIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match &self.bucket.inner {
-            CompactBucketInner::Small { count, edges, policies, regrets } => {
+            CompactBucketInner::Small {
+                count,
+                edges,
+                policies,
+                regrets,
+            } => {
                 if self.index < *count as usize {
                     let i = self.index;
                     self.index += 1;
@@ -315,12 +346,10 @@ impl<'a> Iterator for BucketIter<'a> {
                     None
                 }
             }
-            CompactBucketInner::Large(bucket) => {
-                bucket.get(self.index).map(|entry| {
-                    self.index += 1;
-                    entry
-                })
-            }
+            CompactBucketInner::Large(bucket) => bucket.get(self.index).map(|entry| {
+                self.index += 1;
+                entry
+            }),
         }
     }
 
@@ -352,7 +381,12 @@ impl<'a> Iterator for BucketIterMut<'a> {
         // Use unsafe to return mutable references with the correct lifetime
         unsafe {
             match &mut (*(&mut self.bucket.inner as *mut CompactBucketInner)) {
-                CompactBucketInner::Small { count, edges, policies, regrets } => {
+                CompactBucketInner::Small {
+                    count,
+                    edges,
+                    policies,
+                    regrets,
+                } => {
                     if index < *count as usize {
                         Some((
                             &mut *(edges.as_mut_ptr().add(index)),
@@ -457,7 +491,7 @@ mod tests {
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0].0, 1);
         // Use approximate equality for f16 precision
-        assert!((f32::from(collected[1].1.0) - 0.2).abs() < 0.001);
+        assert!((f32::from(collected[1].1 .0) - 0.2).abs() < 0.001);
     }
 
     #[test]
@@ -471,16 +505,20 @@ mod tests {
 
     #[test]
     fn test_memory_comparison() {
-        use std::mem::size_of;
         use smallvec::SmallVec;
+        use std::mem::size_of;
 
         // Original SmallVec type
         type OriginalBucket = SmallVec<[(u8, (f16, f32)); 4]>;
 
         println!("Memory size comparison:");
-        println!("  SmallVec<[(u8, (f16, f32)); 4]>: {} bytes", size_of::<OriginalBucket>());
+        println!(
+            "  SmallVec<[(u8, (f16, f32)); 4]>: {} bytes",
+            size_of::<OriginalBucket>()
+        );
         println!("  CompactBucket: {} bytes", size_of::<CompactBucket>());
-        println!("  Savings: {} bytes ({:.1}% reduction)",
+        println!(
+            "  Savings: {} bytes ({:.1}% reduction)",
             size_of::<OriginalBucket>() - size_of::<CompactBucket>(),
             (1.0 - size_of::<CompactBucket>() as f64 / size_of::<OriginalBucket>() as f64) * 100.0
         );

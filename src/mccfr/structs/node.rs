@@ -34,7 +34,11 @@ where
     G: Game<E = E, T = T>,
     I: Info<E = E, T = T>,
 {
-    pub fn from(index: NodeIndex, graph: &'tree DiGraph<(G, u32), E>, arena: &'tree Vec<I>) -> Self {
+    pub fn from(
+        index: NodeIndex,
+        graph: &'tree DiGraph<(G, u32), E>,
+        arena: &'tree Vec<I>,
+    ) -> Self {
         Self {
             index,
             graph,

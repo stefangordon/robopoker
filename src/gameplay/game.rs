@@ -84,6 +84,10 @@ impl Game {
     pub fn board(&self) -> Board {
         self.board
     }
+    /// Get the dealer position (button) for the current game
+    pub fn dealer(&self) -> Position {
+        self.dealer
+    }
     pub fn turn(&self) -> Turn {
         if self.must_stop() {
             Turn::Terminal
@@ -233,7 +237,7 @@ impl Game {
                 } else {
                     a
                 }
-            },
+            }
             Action::Draw(hand) if hand.size() == 0 => {
                 // Handle "DEAL" without explicit cards - deal the appropriate cards for this street
                 if self.must_deal() {
@@ -241,8 +245,8 @@ impl Game {
                 } else {
                     a
                 }
-            },
-            _ => a
+            }
+            _ => a,
         };
 
         // Check if the adjusted action is allowed
@@ -374,7 +378,11 @@ impl Game {
     /// all players have acted at least once
     fn is_everyone_touched(&self) -> bool {
         let pref_offset = if self.street() == Street::Pref {
-            if self.n() == 2 { 1 } else { 2 }
+            if self.n() == 2 {
+                1
+            } else {
+                2
+            }
         } else {
             0
         };
@@ -540,8 +548,9 @@ impl Game {
 
 /// effective bet sizes
 impl Game {
-    #[allow(dead_code)]
-    fn effective_stack(&self) -> Chips {
+    /// Calculate the effective stack size (second-largest stack among all players)
+    /// This represents the maximum amount that can be won/lost in the hand
+    pub fn effective_stack(&self) -> Chips {
         let mut totals = self
             .seats
             .iter()
@@ -673,22 +682,35 @@ impl Game {
         let allowed_actions = self.legal();
         let state_info = format!(
             "Game state: dealer={}, ticker={}, street={}, pot={}",
-            self.dealer, self.ticker, self.street(), self.pot
+            self.dealer,
+            self.ticker,
+            self.street(),
+            self.pot
         );
 
         let actor_info = format!(
             "Actor (pos {}) state: {}, stack={}, stake={}",
-            self.actor_idx(), self.actor_ref().state(), self.actor_ref().stack(), self.actor_ref().stake()
+            self.actor_idx(),
+            self.actor_ref().state(),
+            self.actor_ref().stack(),
+            self.actor_ref().stake()
         );
 
         let effective = format!(
             "Effective stake: {}, to_call: {}, to_raise: {}, to_shove: {}",
-            self.effective_stake(), self.to_call(), self.to_raise(), self.to_shove()
+            self.effective_stake(),
+            self.to_call(),
+            self.to_raise(),
+            self.to_shove()
         );
 
         let is_info = format!(
             "Constraints: may_fold={}, may_call={}, may_check={}, may_raise={}, may_shove={}",
-            self.may_fold(), self.may_call(), self.may_check(), self.may_raise(), self.may_shove()
+            self.may_fold(),
+            self.may_call(),
+            self.may_check(),
+            self.may_raise(),
+            self.may_shove()
         );
 
         format!(
@@ -737,7 +759,7 @@ impl Game {
                     // Inside legal range – keep amount.
                     Some(Action::Raise(*chips))
                 }
-            },
+            }
             Action::Shove(_chips) => {
                 // Find nearest Shove action
                 if self.may_shove() {
@@ -745,9 +767,9 @@ impl Game {
                     return Some(Action::Shove(self.to_shove()));
                 }
                 None
-            },
+            }
             // For other action types, no "close" alternative exists
-            _ => None
+            _ => None,
         }
     }
 }
@@ -1022,5 +1044,4 @@ mod tests {
         assert!(game.is_everyone_touched() == true); //
         assert!(game.is_everyone_matched() == true); //
     }
-
 }

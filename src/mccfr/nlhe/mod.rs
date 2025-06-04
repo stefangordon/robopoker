@@ -8,6 +8,9 @@ pub mod profile;
 pub mod solver;
 pub mod turn;
 
+#[cfg(feature = "native")]
+pub mod model_data;
+
 pub use edge::Edge;
 pub use encoder::Encoder;
 pub use game::Game;

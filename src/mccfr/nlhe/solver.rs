@@ -1,11 +1,11 @@
 use super::profile::Profile;
 use crate::cards::street::Street;
-use crate::save::disk::Disk;
-use crate::Arbitrary;
 use crate::mccfr::nlhe::encoder::{BlueprintEncoder, BlueprintSizer};
 use crate::mccfr::nlhe::{Edge, Game, Info, Turn};
 use crate::mccfr::structs::tree::Tree;
 use crate::mccfr::types::branch::Branch;
+use crate::save::disk::Disk;
+use crate::Arbitrary;
 
 /// NLHE represents the complete Monte Carlo Counterfactual Regret Minimization (MCCFR) algorithm
 /// for No-Limit Hold'em poker. It combines:
@@ -36,7 +36,11 @@ impl crate::mccfr::traits::encoder::Encoder for NLHE {
         self.sampler.seed(root)
     }
 
-    fn info(&self, tree: &Tree<Self::T, Self::E, Self::G, Self::I>, leaf: Branch<Self::E, Self::G>) -> Self::I {
+    fn info(
+        &self,
+        tree: &Tree<Self::T, Self::E, Self::G, Self::I>,
+        leaf: Branch<Self::E, Self::G>,
+    ) -> Self::I {
         self.sampler.info(tree, leaf)
     }
 }

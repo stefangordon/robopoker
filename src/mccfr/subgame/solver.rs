@@ -1,21 +1,21 @@
-use crate::gameplay::edge::Edge;
-use crate::mccfr::nlhe::Game;
-use crate::mccfr::nlhe::info::Info;
-use crate::gameplay::turn::Turn;
-use super::{SUBGAME_MIN_ITERATIONS, SUBGAME_MAX_ITERATIONS};
-use crate::mccfr::types::decision::Decision;
+use super::SubgameSizer;
+use super::{SUBGAME_MAX_ITERATIONS, SUBGAME_MIN_ITERATIONS};
 use crate::cards::isomorphism::Isomorphism;
 use crate::clustering::abstraction::Abstraction;
+use crate::gameplay::edge::Edge;
+use crate::gameplay::turn::Turn;
+use crate::mccfr::nlhe::encoder::Encoder as GameEncoder;
+use crate::mccfr::nlhe::info::Info;
+use crate::mccfr::nlhe::profile::{Profile as NLProfile, ProfileBuilder};
+use crate::mccfr::nlhe::Game;
 use crate::mccfr::structs::tree::Tree;
 use crate::mccfr::traits::encoder::Encoder;
+use crate::mccfr::traits::info::Info as InfoTrait;
 use crate::mccfr::traits::profile::Profile;
 use crate::mccfr::types::counterfactual::Counterfactual;
+use crate::mccfr::types::decision::Decision;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
-use crate::mccfr::nlhe::encoder::Encoder as GameEncoder;
-use crate::mccfr::nlhe::profile::{Profile as NLProfile, ProfileBuilder};
-use super::SubgameSizer;
-use crate::mccfr::traits::info::Info as InfoTrait;
 type SGEncoder = GameEncoder<SubgameSizer>;
 
 /// Subgame solver for re-solving game trees with enhanced action abstraction
@@ -60,9 +60,13 @@ impl SubgameSolver {
             let translated_strategy = self.translate_warm_start_to_subgame(&subgame_edges);
 
             if !translated_strategy.is_empty() {
-                log::debug!("Translated warm start: {} blueprint actions -> {} subgame actions",
-                           self.warm_start.len(), translated_strategy.len());
-                self.profile.seed_decisions(&root_info, &translated_strategy);
+                log::debug!(
+                    "Translated warm start: {} blueprint actions -> {} subgame actions",
+                    self.warm_start.len(),
+                    translated_strategy.len()
+                );
+                self.profile
+                    .seed_decisions(&root_info, &translated_strategy);
             } else {
                 log::warn!("Failed to translate warm start strategy to subgame action space");
             }
@@ -74,7 +78,12 @@ impl SubgameSolver {
         log::debug!("Initial subgame strategy: {} actions", last_strategy.len());
         if log::log_enabled!(log::Level::Trace) {
             for (i, decision) in last_strategy.iter().enumerate() {
-                log::trace!("  Action {}: edge={:?} weight={:.4}", i, decision.edge(), decision.weight());
+                log::trace!(
+                    "  Action {}: edge={:?} weight={:.4}",
+                    i,
+                    decision.edge(),
+                    decision.weight()
+                );
             }
         }
 
@@ -102,7 +111,8 @@ impl SubgameSolver {
             i += current_chunk_size;
 
             // Check for convergence every 10 iterations, but only after minimum iterations
-            if i >= 50 && i % 10 == 0 {  // Don't check convergence until at least 50 iterations
+            if i >= 50 && i % 10 == 0 {
+                // Don't check convergence until at least 50 iterations
                 let current_strategy = self.root_strategy(&root_info);
                 if Self::has_converged(&last_strategy, &current_strategy, &mut stable) {
                     converged_at = Some(i);
@@ -115,10 +125,18 @@ impl SubgameSolver {
         let elapsed = start_time.elapsed();
         match converged_at {
             Some(iterations) => {
-                log::info!("Subgame converged: {} iterations in {:.1}ms", iterations, elapsed.as_secs_f64() * 1000.0);
+                log::info!(
+                    "Subgame converged: {} iterations in {:.1}ms",
+                    iterations,
+                    elapsed.as_secs_f64() * 1000.0
+                );
             }
             None => {
-                log::info!("Subgame completed: {} iterations in {:.1}ms (no convergence)", self.iterations, elapsed.as_secs_f64() * 1000.0);
+                log::info!(
+                    "Subgame completed: {} iterations in {:.1}ms (no convergence)",
+                    self.iterations,
+                    elapsed.as_secs_f64() * 1000.0
+                );
             }
         }
 
@@ -131,9 +149,17 @@ impl SubgameSolver {
 
         // Log the original warm start strategy
         if log::log_enabled!(log::Level::Debug) {
-            log::debug!("Original warm start strategy ({} actions):", self.warm_start.len());
+            log::debug!(
+                "Original warm start strategy ({} actions):",
+                self.warm_start.len()
+            );
             for (i, decision) in self.warm_start.iter().enumerate() {
-                log::debug!("  {}: edge={:?} weight={:.6}", i, decision.edge(), decision.weight());
+                log::debug!(
+                    "  {}: edge={:?} weight={:.6}",
+                    i,
+                    decision.edge(),
+                    decision.weight()
+                );
             }
         }
 
@@ -161,11 +187,16 @@ impl SubgameSolver {
                    check_weight, fold_weight, call_weight, raise_weight, shove_weight, draw_weight);
 
         // Count total raise edges in subgame
-        let raise_edge_count = subgame_edges.iter()
+        let raise_edge_count = subgame_edges
+            .iter()
             .filter(|e| matches!(e, Edge::Raise(_)))
             .count() as f32;
 
-        log::debug!("Subgame has {} raise edges out of {} total edges", raise_edge_count, subgame_edges.len());
+        log::debug!(
+            "Subgame has {} raise edges out of {} total edges",
+            raise_edge_count,
+            subgame_edges.len()
+        );
 
         // Map to subgame edges
         for &edge in subgame_edges {
@@ -189,15 +220,25 @@ impl SubgameSolver {
                         };
 
                         let distributed_weight = (raise_weight * preference) / raise_edge_count;
-                        log::debug!("  Raise {:?} (ratio={:.2}): preference={:.1} -> weight={:.6}",
-                                   odds, pot_ratio, preference, distributed_weight);
+                        log::debug!(
+                            "  Raise {:?} (ratio={:.2}): preference={:.1} -> weight={:.6}",
+                            odds,
+                            pot_ratio,
+                            preference,
+                            distributed_weight
+                        );
                         distributed_weight
                     } else {
                         // Blueprint has no raises, give subgame raises small weight
-                        let total_non_raise_weight = check_weight + fold_weight + call_weight + shove_weight + draw_weight;
+                        let total_non_raise_weight =
+                            check_weight + fold_weight + call_weight + shove_weight + draw_weight;
                         if total_non_raise_weight > 0.0 && raise_edge_count > 0.0 {
                             let fallback_weight = (total_non_raise_weight * 0.1) / raise_edge_count;
-                            log::debug!("  Raise {:?}: fallback weight={:.6}", odds, fallback_weight);
+                            log::debug!(
+                                "  Raise {:?}: fallback weight={:.6}",
+                                odds,
+                                fallback_weight
+                            );
                             fallback_weight
                         } else {
                             0.0
@@ -216,15 +257,21 @@ impl SubgameSolver {
         log::debug!("Pre-normalization total weight: {:.6}", total_weight);
 
         if total_weight > 0.0 {
-            let normalized = translated.into_iter().map(|d| {
-                Decision::from((d.edge(), d.weight() / total_weight))
-            }).collect::<Vec<_>>();
+            let normalized = translated
+                .into_iter()
+                .map(|d| Decision::from((d.edge(), d.weight() / total_weight)))
+                .collect::<Vec<_>>();
 
             // Log final translated strategy
             if log::log_enabled!(log::Level::Debug) {
                 log::debug!("Final translated strategy ({} actions):", normalized.len());
                 for (i, decision) in normalized.iter().enumerate() {
-                    log::debug!("  {}: edge={:?} weight={:.6}", i, decision.edge(), decision.weight());
+                    log::debug!(
+                        "  {}: edge={:?} weight={:.6}",
+                        i,
+                        decision.edge(),
+                        decision.weight()
+                    );
                 }
             }
 
@@ -253,7 +300,11 @@ impl SubgameSolver {
             .map(|infoset| self.counterfactual(&infoset))
             .collect::<Vec<_>>();
 
-        log::trace!("Generated {} counterfactual updates from {} trees", updates.len(), batch_size);
+        log::trace!(
+            "Generated {} counterfactual updates from {} trees",
+            updates.len(),
+            batch_size
+        );
         updates
     }
 
@@ -286,15 +337,23 @@ impl SubgameSolver {
     }
 
     /// Compute counterfactual values for an infoset
-    fn counterfactual(&self, infoset: &crate::mccfr::structs::infoset::InfoSet<Turn, Edge, Game, Info>) -> Counterfactual<Edge, Info> {
+    fn counterfactual(
+        &self,
+        infoset: &crate::mccfr::structs::infoset::InfoSet<Turn, Edge, Game, Info>,
+    ) -> Counterfactual<Edge, Info> {
         let regret_vec = self.profile.regret_vector(infoset);
         let policy_vec = self.profile.policy_vector(infoset);
 
         if log::log_enabled!(log::Level::Trace) {
             let regret_sum: f32 = regret_vec.iter().map(|(_, r)| r.abs()).sum();
             let policy_sum: f32 = policy_vec.iter().map(|(_, p)| *p).sum();
-            log::trace!("Counterfactual: {} regrets (sum={:.6}), {} policies (sum={:.6})",
-                       regret_vec.len(), regret_sum, policy_vec.len(), policy_sum);
+            log::trace!(
+                "Counterfactual: {} regrets (sum={:.6}), {} policies (sum={:.6})",
+                regret_vec.len(),
+                regret_sum,
+                policy_vec.len(),
+                policy_sum
+            );
         }
 
         (infoset.info(), regret_vec, policy_vec)
@@ -303,7 +362,10 @@ impl SubgameSolver {
     /// Return true when the root behaviour strategy has stabilised.
     /// - `stable` is a small counter kept by the caller.
     fn has_converged(old: &[Decision], new: &[Decision], stable: &mut u8) -> bool {
-        if old.len() != new.len() { *stable = 0; return false; }
+        if old.len() != new.len() {
+            *stable = 0;
+            return false;
+        }
 
         // Largest single-action change (L∞)
         let mut max_diff = 0f32;
@@ -311,16 +373,16 @@ impl SubgameSolver {
             max_diff = max_diff.max((o.weight() - n.weight()).abs());
         }
 
-        const MAX_EPS: f32 = 0.005;   // 0.1 %
+        const MAX_EPS: f32 = 0.005; // 0.1 %
 
         if max_diff < MAX_EPS {
-            *stable += 1;            // one more stable check
+            *stable += 1; // one more stable check
         } else {
-            *stable = 0;             // reset streak
+            *stable = 0; // reset streak
         }
 
         log::debug!("Δ_max {:.5}  stable {}", max_diff, *stable);
-        *stable >= 2                // stop after 2 consecutive passes
+        *stable >= 2 // stop after 2 consecutive passes
     }
 
     /// Extract root strategy using positive-regret matching with fallbacks.
@@ -330,20 +392,20 @@ impl SubgameSolver {
         if all_choices.is_empty() {
             return Vec::new();
         }
-        
+
         // Get all regrets in a single batch operation
         let all_regrets = self.profile.get_all_regrets(info);
-        
+
         // Calculate sum of positive regrets across ALL possible choices
         let mut pos_sum = 0.0f32;
         let mut regrets_with_edges = Vec::with_capacity(all_choices.len());
-        
+
         for choice_edge in all_choices.iter() {
             let regret = all_regrets
                 .iter()
                 .find_map(|(e, r)| if e == choice_edge { Some(*r) } else { None })
                 .unwrap_or(0.0);
-            
+
             regrets_with_edges.push((*choice_edge, regret));
             if regret > 0.0 {
                 pos_sum += regret;
@@ -359,20 +421,20 @@ impl SubgameSolver {
         } else {
             // Fall back to accumulated policy σ̄ - get all policies in one batch
             let all_policies = self.profile.get_all_policies(info);
-            
+
             let mut sum_policy = 0.0f32;
             let mut policies_with_edges = Vec::with_capacity(all_choices.len());
-            
+
             for choice_edge in all_choices.iter() {
                 let policy = all_policies
                     .iter()
                     .find_map(|(e, p)| if e == choice_edge { Some(*p) } else { None })
                     .unwrap_or(0.0);
-                
+
                 policies_with_edges.push((*choice_edge, policy));
                 sum_policy += policy;
             }
-                
+
             if sum_policy > 0.0 {
                 policies_with_edges
                     .into_iter()

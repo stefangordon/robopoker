@@ -156,10 +156,8 @@ pub trait Profile {
         // Pre-compute the expected value for each root. This value is identical
         // for every edge we are about to iterate over, so caching avoids an
         // expensive `expected_value` call per (root, edge) pair.
-        let expected_by_root: Vec<crate::Utility> = roots
-            .iter()
-            .map(|root| self.expected_value(root))
-            .collect();
+        let expected_by_root: Vec<crate::Utility> =
+            roots.iter().map(|root| self.expected_value(root)).collect();
 
         // Iterate over the available choices exactly once, producing the regret
         // for each edge. We accumulate (cfactual - expected) across all roots.
@@ -173,15 +171,31 @@ pub trait Profile {
                     let cfactual = self.cfactual_value(root, &edge);
                     let expected = expected_by_root[idx];
 
-                    debug_assert!(!cfactual.is_nan(), "cfactual_value produced NaN for edge {:?}", edge);
+                    debug_assert!(
+                        !cfactual.is_nan(),
+                        "cfactual_value produced NaN for edge {:?}",
+                        edge
+                    );
                     debug_assert!(!expected.is_nan(), "expected_value produced NaN");
-                    debug_assert!(!cfactual.is_infinite(), "cfactual_value produced infinity for edge {:?}", edge);
+                    debug_assert!(
+                        !cfactual.is_infinite(),
+                        "cfactual_value produced infinity for edge {:?}",
+                        edge
+                    );
                     debug_assert!(!expected.is_infinite(), "expected_value produced infinity");
 
                     regret_sum += cfactual - expected;
                 }
-                debug_assert!(!regret_sum.is_nan(), "regret_sum became NaN for edge {:?}", edge);
-                debug_assert!(!regret_sum.is_infinite(), "regret_sum became infinite for edge {:?}", edge);
+                debug_assert!(
+                    !regret_sum.is_nan(),
+                    "regret_sum became NaN for edge {:?}",
+                    edge
+                );
+                debug_assert!(
+                    !regret_sum.is_infinite(),
+                    "regret_sum became infinite for edge {:?}",
+                    edge
+                );
                 (edge, regret_sum)
             })
             .collect::<Policy<Self::E>>()
@@ -227,14 +241,31 @@ pub trait Profile {
             .choices()
             .iter()
             .map(|e| self.sum_regret(info, e))
-            .inspect(|r| assert!(!r.is_infinite(), "regret value is infinite for edge in policy calculation"))
+            .inspect(|r| {
+                assert!(
+                    !r.is_infinite(),
+                    "regret value is infinite for edge in policy calculation"
+                )
+            })
             .map(|r| r.max(crate::POLICY_MIN))
             .sum::<crate::Utility>();
 
-        debug_assert!(denom > 0.0, "denominator is zero or negative in policy calculation");
+        debug_assert!(
+            denom > 0.0,
+            "denominator is zero or negative in policy calculation"
+        );
         let result = numer / denom;
-        debug_assert!(!result.is_nan(), "policy calculation produced NaN: {} / {}", numer, denom);
-        debug_assert!(result >= 0.0 && result <= 1.0, "policy value out of bounds: {}", result);
+        debug_assert!(
+            !result.is_nan(),
+            "policy calculation produced NaN: {} / {}",
+            numer,
+            denom
+        );
+        debug_assert!(
+            result >= 0.0 && result <= 1.0,
+            "policy value out of bounds: {}",
+            result
+        );
 
         result
     }
@@ -338,7 +369,8 @@ pub trait Profile {
         &self,
         leaf: &Node<Self::T, Self::E, Self::G, Self::I>,
     ) -> crate::Probability {
-        let result = leaf.into_iter()
+        let result = leaf
+            .into_iter()
             .filter(|(parent, _)| self.walker() != parent.game().turn())
             .map(|(parent, incoming)| self.sample(parent.info(), &incoming))
             .product::<crate::Probability>()
@@ -369,7 +401,11 @@ pub trait Profile {
         debug_assert!(!reach.is_nan(), "relative_reach produced NaN");
         debug_assert!(!payoff.is_nan(), "payoff produced NaN");
         debug_assert!(!sampling.is_nan(), "sampling_reach produced NaN");
-        debug_assert!(sampling > 0.0, "sampling_reach is zero or negative: {}", sampling);
+        debug_assert!(
+            sampling > 0.0,
+            "sampling_reach is zero or negative: {}",
+            sampling
+        );
 
         // Compute raw counterfactual utility
         let raw = reach * payoff / sampling;
@@ -378,7 +414,11 @@ pub trait Profile {
         // Determine sign for clamping NaN or infinite values
         // If raw is NaN, infer sign from payoff
         let sign = if raw.is_nan() {
-            if payoff < 0.0 { -1.0 } else { 1.0 }
+            if payoff < 0.0 {
+                -1.0
+            } else {
+                1.0
+            }
         } else {
             raw.signum()
         };
@@ -391,7 +431,10 @@ pub trait Profile {
         };
 
         debug_assert!(!result.is_nan(), "relative_value produced NaN after clamp");
-        debug_assert!(!result.is_infinite(), "relative_value still infinite after clamp");
+        debug_assert!(
+            !result.is_infinite(),
+            "relative_value still infinite after clamp"
+        );
 
         result
     }

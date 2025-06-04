@@ -1,5 +1,5 @@
-use crate::mccfr::types::decision::Decision;
 use crate::mccfr::traits::{encoder::Encoder as EncoderTrait, profile::Profile as ProfileTrait};
+use crate::mccfr::types::decision::Decision;
 
 /// Trait for plug-in convergence checking policies.
 /// Implementations decide when the outer MCCFR loop should stop.
@@ -23,7 +23,6 @@ impl ConvergenceRule for NeverConverge {
 pub struct DeltaThreshold {
     pub eps: f32,
 }
-
 
 impl ConvergenceRule for DeltaThreshold {
     fn has_converged(&mut self, old: &[Decision], new: &[Decision]) -> bool {
@@ -60,12 +59,21 @@ where
     Stop: ConvergenceRule,
 {
     pub fn new(profile: P, encoder: Enc, stop: Stop) -> Self {
-        Self { profile, encoder, stop }
+        Self {
+            profile,
+            encoder,
+            stop,
+        }
     }
 
     /// Generic solve loop.  Returns the root strategy after `max_iter` epochs or
     /// earlier if the `stop` rule fires after `min_iter` epochs.
-    pub fn solve<G>(&mut self, _root_game: &P::G, _min_iter: usize, _max_iter: usize) -> Vec<Decision> {
+    pub fn solve<G>(
+        &mut self,
+        _root_game: &P::G,
+        _min_iter: usize,
+        _max_iter: usize,
+    ) -> Vec<Decision> {
         unimplemented!("Generic driver solve loop not yet integrated – to be implemented in follow-up commits.")
     }
 

@@ -21,7 +21,7 @@ impl Decision {
     pub fn edge(&self) -> Edge {
         self.edge
     }
-    
+
     /// Get the probability/weight for this decision
     pub fn weight(&self) -> Probability {
         self.prob
@@ -30,10 +30,7 @@ impl Decision {
 
 impl From<(Edge, Probability)> for Decision {
     fn from((edge, prob): (Edge, Probability)) -> Self {
-        Self {
-            edge,
-            prob,
-        }
+        Self { edge, prob }
     }
 }
 
@@ -44,4 +41,4 @@ impl From<tokio_postgres::Row> for Decision {
             prob: Probability::from(row.get::<_, f32>("policy")),
         }
     }
-} 
+}

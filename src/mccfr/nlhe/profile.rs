@@ -1,34 +1,33 @@
+use super::compact_bucket::CompactBucket;
 use super::edge::Edge;
 use super::game::Game;
 use super::info::Info;
 use super::turn::Turn;
-use super::compact_bucket::CompactBucket;
 use crate::cards::street::Street;
-use crate::Arbitrary;
-use zstd::stream::Decoder as ZDecoder;
-use dashmap::DashMap;
-use parking_lot::RwLock;
-use crate::mccfr::types::policy::Policy;
-use crate::mccfr::types::decision::Decision;
 use crate::mccfr::traits::info::Info as InfoTrait;
-use std::path::PathBuf;
-use rustc_hash::FxHasher;
-use std::hash::BuildHasher;
-use half::f16;
+use crate::mccfr::types::decision::Decision;
+use crate::mccfr::types::policy::Policy;
+use crate::Arbitrary;
 #[cfg(feature = "native")]
 use arrow2::{
-    array::{Int64Array, UInt32Array, Float32Array, Array},
+    array::{Array, Float32Array, Int64Array, UInt32Array},
     chunk::Chunk,
     datatypes::{DataType, Field, Schema},
     io::parquet::{
-        read::{read_metadata, infer_schema, FileReader},
+        read::{infer_schema, read_metadata, FileReader},
         write::{
-            CompressionOptions, Encoding, FileWriter, RowGroupIterator,
-            Version, WriteOptions
+            CompressionOptions, Encoding, FileWriter, RowGroupIterator, Version, WriteOptions,
         },
     },
 };
+use dashmap::DashMap;
+use half::f16;
+use parking_lot::RwLock;
+use rustc_hash::FxHasher;
+use std::hash::BuildHasher;
+use std::path::PathBuf;
 use std::sync::Arc;
+use zstd::stream::Decoder as ZDecoder;
 
 // File format constants and specifications
 //
@@ -56,7 +55,11 @@ type Bucket = CompactBucket;
 #[inline(always)]
 fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
     let val = val.max(min).min(max); // NaNs will propagate
-    if val.is_nan() { 0.0 } else { val }
+    if val.is_nan() {
+        0.0
+    } else {
+        val
+    }
 }
 
 pub struct Profile {
@@ -95,7 +98,9 @@ impl Profile {
         for bucket_entry in self.encounters.iter() {
             let bucket = bucket_entry.value().read();
             let n = bucket.len();
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
 
             // Count near-zero regrets
             for (_, (_, regret)) in bucket.iter() {
@@ -106,7 +111,8 @@ impl Profile {
             }
 
             // Calculate strategy entropy for this infoset
-            let weights: Vec<f32> = bucket.iter()
+            let weights: Vec<f32> = bucket
+                .iter()
                 .map(|(_, (policy, _))| f32::from(policy).max(0.0))
                 .collect();
             let sum: f32 = weights.iter().sum();
@@ -158,81 +164,186 @@ impl Profile {
     /// Enabled by setting environment variable `BLUEPRINT_STATS=1` before running.
     #[cfg(feature = "native")]
     pub fn log_stats(&self) {
+        use rayon::prelude::*;
         use std::f32::{INFINITY, NEG_INFINITY};
 
-        let mut infosets = 0usize;
-        let mut total_edges = 0usize;
-        let mut min_edges = usize::MAX;
-        let mut max_edges = 0usize;
+        // Structure to hold stats for each thread
+        #[derive(Clone)]
+        struct Stats {
+            infosets: usize,
+            total_edges: usize,
+            min_edges: usize,
+            max_edges: usize,
+            edge_count_dist: [usize; 14],
+            policy_min: f32,
+            policy_max: f32,
+            regret_min: f32,
+            regret_max: f32,
+            regret_buckets: [usize; 8],
+            policy_buckets: [usize; 5],
+            zero_regret_count: usize,
+        }
 
-        // Add edge count distribution tracking
-        let mut edge_count_dist = [0usize; 14]; // 0-13 edges
-
-        let mut policy_min = INFINITY;
-        let mut policy_max = NEG_INFINITY;
-        let mut regret_min = INFINITY;
-        let mut regret_max = NEG_INFINITY;
-
-        // Distribution tracking
-        let mut regret_buckets = [0usize; 8]; // [-inf, -1M, -10k, -100, 0, 100, 10k, 1M, inf]
-        let mut policy_buckets = [0usize; 5]; // [0, 1, 10, 100, inf]
-        let mut zero_regret_count = 0usize;
-
-        for bucket_entry in self.encounters.iter() {
-            infosets += 1;
-            let bucket = bucket_entry.value().read();
-            let count = bucket.len();
-            total_edges += count;
-            min_edges = min_edges.min(count);
-            max_edges = max_edges.max(count);
-
-            // Track edge count distribution
-            if count < edge_count_dist.len() {
-                edge_count_dist[count] += 1;
-            }
-
-            for (_, (policy, regret)) in bucket.iter() {
-                let pol_f32 = f32::from(policy);
-                policy_min = policy_min.min(pol_f32);
-                policy_max = policy_max.max(pol_f32);
-                regret_min = regret_min.min(regret);
-                regret_max = regret_max.max(regret);
-
-                // Bucket regrets
-                if regret == 0.0 {
-                    zero_regret_count += 1;
-                } else if regret < -1_000_000.0 {
-                    regret_buckets[0] += 1;
-                } else if regret < -10_000.0 {
-                    regret_buckets[1] += 1;
-                } else if regret < -100.0 {
-                    regret_buckets[2] += 1;
-                } else if regret < 0.0 {
-                    regret_buckets[3] += 1;
-                } else if regret < 100.0 {
-                    regret_buckets[4] += 1;
-                } else if regret < 10_000.0 {
-                    regret_buckets[5] += 1;
-                } else if regret < 1_000_000.0 {
-                    regret_buckets[6] += 1;
-                } else {
-                    regret_buckets[7] += 1;
-                }
-
-                // Bucket policies
-                if pol_f32 < 1.0 {
-                    policy_buckets[0] += 1;
-                } else if pol_f32 < 10.0 {
-                    policy_buckets[1] += 1;
-                } else if pol_f32 < 100.0 {
-                    policy_buckets[2] += 1;
-                } else if pol_f32 < 1000.0 {
-                    policy_buckets[3] += 1;
-                } else {
-                    policy_buckets[4] += 1;
+        impl Default for Stats {
+            fn default() -> Self {
+                Self {
+                    infosets: 0,
+                    total_edges: 0,
+                    min_edges: usize::MAX,
+                    max_edges: 0,
+                    edge_count_dist: [0; 14],
+                    policy_min: INFINITY,
+                    policy_max: NEG_INFINITY,
+                    regret_min: INFINITY,
+                    regret_max: NEG_INFINITY,
+                    regret_buckets: [0; 8],
+                    policy_buckets: [0; 5],
+                    zero_regret_count: 0,
                 }
             }
         }
+
+        // Parallel map-reduce over all encounters
+        // Collect entries first since DashMap doesn't support par_iter directly
+        let entries: Vec<_> = self.encounters.iter().collect();
+        let final_stats = entries
+            .par_iter()
+            .map(|bucket_entry| {
+                let mut stats = Stats::default();
+
+                stats.infosets = 1;
+                let bucket = bucket_entry.value().read();
+                let count = bucket.len();
+                stats.total_edges = count;
+                stats.min_edges = count;
+                stats.max_edges = count;
+
+                // Track edge count distribution
+                if count < stats.edge_count_dist.len() {
+                    stats.edge_count_dist[count] = 1;
+                }
+
+                for (_, (policy, regret)) in bucket.iter() {
+                    let pol_f32 = f32::from(policy);
+                    stats.policy_min = stats.policy_min.min(pol_f32);
+                    stats.policy_max = stats.policy_max.max(pol_f32);
+                    stats.regret_min = stats.regret_min.min(regret);
+                    stats.regret_max = stats.regret_max.max(regret);
+
+                    // Bucket regrets
+                    if regret == 0.0 {
+                        stats.zero_regret_count += 1;
+                    } else if regret < -1_000_000.0 {
+                        stats.regret_buckets[0] += 1;
+                    } else if regret < -10_000.0 {
+                        stats.regret_buckets[1] += 1;
+                    } else if regret < -100.0 {
+                        stats.regret_buckets[2] += 1;
+                    } else if regret < 0.0 {
+                        stats.regret_buckets[3] += 1;
+                    } else if regret < 100.0 {
+                        stats.regret_buckets[4] += 1;
+                    } else if regret < 10_000.0 {
+                        stats.regret_buckets[5] += 1;
+                    } else if regret < 1_000_000.0 {
+                        stats.regret_buckets[6] += 1;
+                    } else {
+                        stats.regret_buckets[7] += 1;
+                    }
+
+                    // Bucket policies
+                    if pol_f32 < 1.0 {
+                        stats.policy_buckets[0] += 1;
+                    } else if pol_f32 < 10.0 {
+                        stats.policy_buckets[1] += 1;
+                    } else if pol_f32 < 100.0 {
+                        stats.policy_buckets[2] += 1;
+                    } else if pol_f32 < 1000.0 {
+                        stats.policy_buckets[3] += 1;
+                    } else {
+                        stats.policy_buckets[4] += 1;
+                    }
+                }
+                stats
+            })
+            .fold(
+                || Stats::default(),
+                |mut a, b| {
+                    // Merge two Stats together
+                    a.infosets += b.infosets;
+                    a.total_edges += b.total_edges;
+                    a.min_edges = a.min_edges.min(b.min_edges);
+                    a.max_edges = a.max_edges.max(b.max_edges);
+
+                    for i in 0..a.edge_count_dist.len() {
+                        a.edge_count_dist[i] += b.edge_count_dist[i];
+                    }
+
+                    a.policy_min = a.policy_min.min(b.policy_min);
+                    a.policy_max = a.policy_max.max(b.policy_max);
+                    a.regret_min = a.regret_min.min(b.regret_min);
+                    a.regret_max = a.regret_max.max(b.regret_max);
+
+                    for i in 0..a.regret_buckets.len() {
+                        a.regret_buckets[i] += b.regret_buckets[i];
+                    }
+
+                    for i in 0..a.policy_buckets.len() {
+                        a.policy_buckets[i] += b.policy_buckets[i];
+                    }
+
+                    a.zero_regret_count += b.zero_regret_count;
+                    a
+                },
+            )
+            .reduce(
+                || Stats::default(),
+                |mut a, b| {
+                    // Final merge across threads
+                    a.infosets += b.infosets;
+                    a.total_edges += b.total_edges;
+                    a.min_edges = a.min_edges.min(b.min_edges);
+                    a.max_edges = a.max_edges.max(b.max_edges);
+
+                    for i in 0..a.edge_count_dist.len() {
+                        a.edge_count_dist[i] += b.edge_count_dist[i];
+                    }
+
+                    a.policy_min = a.policy_min.min(b.policy_min);
+                    a.policy_max = a.policy_max.max(b.policy_max);
+                    a.regret_min = a.regret_min.min(b.regret_min);
+                    a.regret_max = a.regret_max.max(b.regret_max);
+
+                    for i in 0..a.regret_buckets.len() {
+                        a.regret_buckets[i] += b.regret_buckets[i];
+                    }
+
+                    for i in 0..a.policy_buckets.len() {
+                        a.policy_buckets[i] += b.policy_buckets[i];
+                    }
+
+                    a.zero_regret_count += b.zero_regret_count;
+                    a
+                },
+            );
+
+        // Extract final values
+        let infosets = final_stats.infosets;
+        let total_edges = final_stats.total_edges;
+        let min_edges = if final_stats.min_edges == usize::MAX {
+            0
+        } else {
+            final_stats.min_edges
+        };
+        let max_edges = final_stats.max_edges;
+        let edge_count_dist = final_stats.edge_count_dist;
+        let policy_min = final_stats.policy_min;
+        let policy_max = final_stats.policy_max;
+        let regret_min = final_stats.regret_min;
+        let regret_max = final_stats.regret_max;
+        let regret_buckets = final_stats.regret_buckets;
+        let policy_buckets = final_stats.policy_buckets;
+        let zero_regret_count = final_stats.zero_regret_count;
 
         let avg_edges = if infosets > 0 {
             total_edges as f64 / infosets as f64
@@ -242,11 +353,19 @@ impl Profile {
 
         log::info!("------------------ BLUEPRINT STATS ------------------");
         log::info!("InfoSets:      {}", infosets);
-        log::info!("Edges / set:   min {}  max {}  avg {:.2}", min_edges, max_edges, avg_edges);
+        log::info!(
+            "Edges / set:   min {}  max {}  avg {:.2}",
+            min_edges,
+            max_edges,
+            avg_edges
+        );
         log::info!("Policy range:  [{:.4}, {:.4}]", policy_min, policy_max);
         log::info!("Regret range:  [{:.4}, {:.4}]", regret_min, regret_max);
-        log::info!("Zero regrets:  {} ({:.2}% of edges)", zero_regret_count,
-                   100.0 * zero_regret_count as f64 / total_edges as f64);
+        log::info!(
+            "Zero regrets:  {} ({:.2}% of edges)",
+            zero_regret_count,
+            100.0 * zero_regret_count as f64 / total_edges as f64
+        );
         log::info!("Regret distribution:");
         log::info!("  < -1M:       {} edges", regret_buckets[0]);
         log::info!("  [-1M, -10k): {} edges", regret_buckets[1]);
@@ -271,8 +390,13 @@ impl Profile {
                 cumulative += freq;
                 let pct = *freq as f64 / infosets as f64 * 100.0;
                 let cum_pct = cumulative as f64 / infosets as f64 * 100.0;
-                log::info!("  {} edges: {:>10} infosets ({:>5.1}%, cum {:>5.1}%)",
-                    count, freq, pct, cum_pct);
+                log::info!(
+                    "  {} edges: {:>10} infosets ({:>5.1}%, cum {:>5.1}%)",
+                    count,
+                    freq,
+                    pct,
+                    cum_pct
+                );
             }
         }
 
@@ -280,7 +404,10 @@ impl Profile {
         let (convergence_ratio, determinism_ratio, avg_entropy) = self.convergence_metrics();
         log::info!("Convergence metrics:");
         log::info!("  Near-zero regrets: {:.1}%", convergence_ratio * 100.0);
-        log::info!("  High-confidence actions: {:.1}%", determinism_ratio * 100.0);
+        log::info!(
+            "  High-confidence actions: {:.1}%",
+            determinism_ratio * 100.0
+        );
         log::info!("  Average entropy: {:.3}", avg_entropy);
 
         // Additional derived metrics
@@ -289,7 +416,10 @@ impl Profile {
         let total_nonzero = negative_regrets + positive_regrets;
         if total_nonzero > 0 {
             let balance_ratio = negative_regrets as f64 / total_nonzero as f64;
-            log::info!("  Negative/Total ratio: {:.1}% (ideal ~50%)", balance_ratio * 100.0);
+            log::info!(
+                "  Negative/Total ratio: {:.1}% (ideal ~50%)",
+                balance_ratio * 100.0
+            );
         }
 
         log::info!("-----------------------------------------------------");
@@ -315,7 +445,14 @@ impl Profile {
     }
 
     /// Apply regret/policy deltas concurrently-safe (called by subgame solver).
-    pub fn apply_updates(&self, updates: Vec<(Info, crate::mccfr::types::policy::Policy<Edge>, crate::mccfr::types::policy::Policy<Edge>)>) {
+    pub fn apply_updates(
+        &self,
+        updates: Vec<(
+            Info,
+            crate::mccfr::types::policy::Policy<Edge>,
+            crate::mccfr::types::policy::Policy<Edge>,
+        )>,
+    ) {
         let current_min = self.regret_min;
         let current_max = self.regret_max;
         for (info, regret_vec, policy_vec) in updates {
@@ -348,7 +485,11 @@ impl Profile {
                     }
                 }) {
                     // Edge doesn't exist, add new entry
-                    let safe_delta = if delta.is_nan() || delta < 0.0 { crate::POLICY_MIN } else { delta };
+                    let safe_delta = if delta.is_nan() || delta < 0.0 {
+                        crate::POLICY_MIN
+                    } else {
+                        delta
+                    };
                     bucket.push((edge_key, (f16::from_f32(safe_delta), 0.0)));
                 }
             }
@@ -387,7 +528,8 @@ impl Profile {
             let sum: f32 = regrets[..all_choices.len()].iter().sum();
 
             // Build result with normalization
-            all_choices.iter()
+            all_choices
+                .iter()
                 .enumerate()
                 .map(|(i, &edge)| (edge, regrets[i] / sum))
                 .collect()
@@ -438,7 +580,8 @@ impl Profile {
             let denom = activation + sum;
 
             // Build result with sampling probabilities
-            all_choices.iter()
+            all_choices
+                .iter()
                 .enumerate()
                 .map(|(i, &edge)| {
                     let numer = activation + policies[i] * threshold;
@@ -453,10 +596,12 @@ impl Profile {
             let denom = activation + sum;
             let numer = activation + crate::POLICY_MIN * threshold;
             let uniform_prob = (numer / denom).max(exploration);
-            all_choices.into_iter().map(|edge| (edge, uniform_prob)).collect()
+            all_choices
+                .into_iter()
+                .map(|edge| (edge, uniform_prob))
+                .collect()
         }
     }
-
 }
 
 impl crate::mccfr::traits::profile::Profile for Profile {
@@ -484,7 +629,13 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             let bucket = bucket_mutex.value().read();
             bucket
                 .iter()
-                .find_map(|(e, (p, _))| if e == u8::from(*edge) { Some(f32::from(p)) } else { None })
+                .find_map(|(e, (p, _))| {
+                    if e == u8::from(*edge) {
+                        Some(f32::from(p))
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_default()
         } else {
             0.0
@@ -849,9 +1000,7 @@ impl crate::save::disk::Disk for Profile {
     }
     fn path(_: Street) -> String {
         let current_dir = std::env::current_dir().unwrap_or_default();
-        let path = PathBuf::from(current_dir)
-            .join("pgcopy")
-            .join(Self::name());
+        let path = PathBuf::from(current_dir).join("pgcopy").join(Self::name());
 
         path.to_string_lossy().into_owned()
     }
@@ -868,7 +1017,8 @@ impl crate::save::disk::Disk for Profile {
         // Detect format by checking for zstd magic bytes
         let mut magic = [0u8; 4];
         let mut file = File::open(&path).expect("Failed to open blueprint file");
-        file.read_exact(&mut magic).expect("Failed to read file header");
+        file.read_exact(&mut magic)
+            .expect("Failed to read file header");
 
         if magic == ZSTD_MAGIC {
             log::debug!("Detected zstd-compressed PostgreSQL binary format (legacy)");
@@ -933,11 +1083,17 @@ impl Profile {
         }
 
         // Calculate total records first
-        let total_records: usize = self.encounters.iter()
+        let total_records: usize = self
+            .encounters
+            .iter()
             .map(|entry| entry.value().read().len())
             .sum();
 
-        log::info!("Saving blueprint to {} ({} records)", path_str, total_records);
+        log::info!(
+            "Saving blueprint to {} ({} records)",
+            path_str,
+            total_records
+        );
 
         let progress = crate::progress(total_records);
         progress.set_message("Saving blueprint to parquet");
@@ -952,32 +1108,34 @@ impl Profile {
             Field::new("policy", DataType::Float32, false),
         ]);
 
-                // Define encodings - use plain encoding to minimize memory usage
+        // Define encodings - use plain encoding to minimize memory usage
         let encodings = vec![
-            vec![Encoding::Plain],      // history
-            vec![Encoding::Plain],      // present
-            vec![Encoding::Plain],      // futures
-            vec![Encoding::Plain],      // edge
-            vec![Encoding::Plain],      // regret
-            vec![Encoding::Plain],      // policy
+            vec![Encoding::Plain], // history
+            vec![Encoding::Plain], // present
+            vec![Encoding::Plain], // futures
+            vec![Encoding::Plain], // edge
+            vec![Encoding::Plain], // regret
+            vec![Encoding::Plain], // policy
         ];
 
         // Write options - optimized for speed while keeping compression
         let options = WriteOptions {
             write_statistics: true, // Keep statistics for better query performance
-            compression: CompressionOptions::Zstd(Some(arrow2::io::parquet::write::ZstdLevel::try_new(1).unwrap())), // Fast ZSTD compression level 1
+            compression: CompressionOptions::Zstd(Some(
+                arrow2::io::parquet::write::ZstdLevel::try_new(1).unwrap(),
+            )), // Fast ZSTD compression level 1
             version: Version::V2,
             data_pagesize_limit: Some(2 * 1024 * 1024), // 2MB pages for good balance
         };
 
-        // Create output file and writer with reasonable buffer
+        // Create output file and writer with large buffer for better I/O performance
         let file = File::create(path).expect(&format!("Failed to create file at {}", path_str));
-        let writer_inner = BufWriter::with_capacity(16 * 1024 * 1024, file); // 16MB buffer
+        let writer_inner = BufWriter::with_capacity(32 * 1024 * 1024, file); // 32MB buffer
         let mut writer = FileWriter::try_new(writer_inner, schema.clone(), options)
             .expect("Failed to create parquet writer");
 
         const RECORDS_PER_CHUNK: usize = 5_000_000; // 3M records per chunk
-        let mut written_records = 0;
+        let written_records = std::sync::atomic::AtomicUsize::new(0);
 
         let mut chunk_histories = Vec::with_capacity(RECORDS_PER_CHUNK);
         let mut chunk_presents = Vec::with_capacity(RECORDS_PER_CHUNK);
@@ -986,11 +1144,11 @@ impl Profile {
         let mut chunk_regrets = Vec::with_capacity(RECORDS_PER_CHUNK);
         let mut chunk_policies = Vec::with_capacity(RECORDS_PER_CHUNK);
 
-        for bucket_entry in self.encounters.iter() {
+                for bucket_entry in self.encounters.iter() {
             let bucket = bucket_entry.key();
             let edges_vec = bucket_entry.value().read();
 
-            for (edge, (policy, regret)) in edges_vec.iter() {
+                    for (edge, (policy, regret)) in edges_vec.iter() {
                 let edge_enum: Edge = edge.into();
                 chunk_histories.push(u64::from(*bucket.history()) as i64);
                 chunk_presents.push(u64::from(*bucket.present()) as i64);
@@ -999,11 +1157,11 @@ impl Profile {
                 chunk_regrets.push(regret);
                 chunk_policies.push(f32::from(policy));
 
-                written_records += 1;
+                let current_count = written_records.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 // Update progress less frequently to reduce overhead
-                if written_records % 1_000_000 == 0 {
-                    progress.set_position(written_records as u64);
+                if current_count % 1_000_000 == 0 {
+                    progress.inc(1_000_000);
                 }
 
                 // Write chunk when it's full
@@ -1028,7 +1186,6 @@ impl Profile {
                     chunk_edges.clear();
                     chunk_regrets.clear();
                     chunk_policies.clear();
-
                 }
             }
         }
@@ -1091,11 +1248,13 @@ impl Profile {
             schema,
             *options,
             encodings.to_vec(),
-        ).expect("Failed to create row group iterator");
+        )
+        .expect("Failed to create row group iterator");
 
         // Write this chunk as a row group
         for group in row_groups {
-            writer.write(group.expect("Failed to get row group"))
+            writer
+                .write(group.expect("Failed to get row group"))
                 .expect("Failed to write row group");
         }
     }
@@ -1106,15 +1265,16 @@ impl Profile {
         use crate::clustering::abstraction::Abstraction;
         use crate::gameplay::path::Path;
         use crate::save::disk::Disk;
-        use std::fs::File;
         use rayon::prelude::*;
+        use std::fs::File;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
         let path_str = Self::path(Street::random());
         log::info!("{:<32}{:<32}", "loading     blueprint", path_str);
 
-        let mut file = File::open(&path_str).expect(&format!("Failed to open blueprint file: {}", path_str));
+        let mut file =
+            File::open(&path_str).expect(&format!("Failed to open blueprint file: {}", path_str));
 
         // Read metadata
         let metadata = read_metadata(&mut file).expect("Failed to read parquet metadata");
@@ -1122,8 +1282,16 @@ impl Profile {
         // Infer schema
         let schema = infer_schema(&metadata).expect("Failed to infer schema");
 
-        let total_rows: usize = metadata.row_groups.iter().map(|rg| rg.num_rows() as usize).sum();
-        log::info!("Loading blueprint from {} row groups ({} total rows)", metadata.row_groups.len(), total_rows);
+        let total_rows: usize = metadata
+            .row_groups
+            .iter()
+            .map(|rg| rg.num_rows() as usize)
+            .sum();
+        log::info!(
+            "Loading blueprint from {} row groups ({} total rows)",
+            metadata.row_groups.len(),
+            total_rows
+        );
 
         let progress = crate::progress(total_rows);
         progress.set_message("Loading blueprint from parquet");
@@ -1168,17 +1336,29 @@ impl Profile {
                             let arrays = chunk.arrays();
                             debug_assert_eq!(arrays.len(), 6, "Unexpected column count");
 
-                            let histories = arrays[0].as_any().downcast_ref::<Int64Array>()
+                            let histories = arrays[0]
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
                                 .expect("history col");
-                            let presents = arrays[1].as_any().downcast_ref::<Int64Array>()
+                            let presents = arrays[1]
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
                                 .expect("present col");
-                            let futures = arrays[2].as_any().downcast_ref::<Int64Array>()
+                            let futures = arrays[2]
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
                                 .expect("futures col");
-                            let edges = arrays[3].as_any().downcast_ref::<UInt32Array>()
+                            let edges = arrays[3]
+                                .as_any()
+                                .downcast_ref::<UInt32Array>()
                                 .expect("edge col");
-                            let regrets = arrays[4].as_any().downcast_ref::<Float32Array>()
+                            let regrets = arrays[4]
+                                .as_any()
+                                .downcast_ref::<Float32Array>()
                                 .expect("regret col");
-                            let policies = arrays[5].as_any().downcast_ref::<Float32Array>()
+                            let policies = arrays[5]
+                                .as_any()
+                                .downcast_ref::<Float32Array>()
                                 .expect("policy col");
 
                             let num_rows = chunk.len();
@@ -1230,10 +1410,10 @@ impl Profile {
         use crate::clustering::abstraction::Abstraction;
         use crate::gameplay::path::Path;
         use crate::mccfr::nlhe::info::Info;
+        use crate::save::disk::Disk;
         use byteorder::{ByteOrder, BE};
         use std::fs::File;
         use std::io::{BufReader, Read};
-        use crate::save::disk::Disk;
 
         let path = Self::path(Street::random());
         log::info!("{:<32}{:<32}", "loading     blueprint (legacy)", path);
@@ -1245,9 +1425,12 @@ impl Profile {
 
         // Skip the PostgreSQL binary COPY header
         let mut skip = [0u8; PGCOPY_HEADER_SIZE];
-        reader.read_exact(&mut skip).expect("Failed to skip pgcopy header");
+        reader
+            .read_exact(&mut skip)
+            .expect("Failed to skip pgcopy header");
 
-        let encounters: DashMap<Info, RwLock<Bucket>, FxBuildHasher> = DashMap::with_hasher(FxBuildHasher::default());
+        let encounters: DashMap<Info, RwLock<Bucket>, FxBuildHasher> =
+            DashMap::with_hasher(FxBuildHasher::default());
         let mut header = [0u8; 2];
         let mut record = [0u8; PGCOPY_RECORD_SIZE - 2]; // 2-byte header already consumed + 64 payload
 
@@ -1262,7 +1445,9 @@ impl Profile {
             debug_assert_eq!(fields, 6, "Unexpected field count: {}", fields);
 
             // Read remaining bytes of the record
-            reader.read_exact(&mut record).expect("Failed to read record bytes");
+            reader
+                .read_exact(&mut record)
+                .expect("Failed to read record bytes");
 
             // Parse PostgreSQL binary format record
             let mut offset = 0;
@@ -1280,8 +1465,16 @@ impl Profile {
             let edge = Edge::from(BE::read_u64(read_field(8)));
             let regret_raw = BE::read_f32(read_field(4));
             let policy_raw = BE::read_f32(read_field(4));
-            let regret = if regret_raw.is_finite() { regret_raw } else { 0.0 };
-            let policy = if policy_raw.is_finite() { policy_raw } else { 0.0 };
+            let regret = if regret_raw.is_finite() {
+                regret_raw
+            } else {
+                0.0
+            };
+            let policy = if policy_raw.is_finite() {
+                policy_raw
+            } else {
+                0.0
+            };
 
             let info = Info::from((history, present, futures));
             let bucket_mutex = encounters
@@ -1304,8 +1497,6 @@ impl Profile {
 
         profile
     }
-
-
 }
 
 /// Custom BuildHasher for FxHasher
@@ -1384,9 +1575,9 @@ mod tests {
     fn create_test_bucket() -> CompactBucket {
         let mut bucket = CompactBucket::new();
         // Add some test data with known edge values
-        bucket.push((1, (f16::from_f32(0.3), 0.0)));  // Edge 1
-        bucket.push((2, (f16::from_f32(0.7), 0.0)));  // Edge 2
-        bucket.push((3, (f16::from_f32(0.5), 0.0)));  // Edge 3
+        bucket.push((1, (f16::from_f32(0.3), 0.0))); // Edge 1
+        bucket.push((2, (f16::from_f32(0.7), 0.0))); // Edge 2
+        bucket.push((3, (f16::from_f32(0.5), 0.0))); // Edge 3
         bucket
     }
 
@@ -1403,11 +1594,13 @@ mod tests {
         ));
 
         // Insert test bucket
-        profile.encounters.insert(info, RwLock::new(create_test_bucket()));
+        profile
+            .encounters
+            .insert(info, RwLock::new(create_test_bucket()));
 
         // Constants from the formula
         let activation = crate::SAMPLING_ACTIVATION; // 0.2
-        let threshold = crate::SAMPLING_THRESHOLD;   // 1.0
+        let threshold = crate::SAMPLING_THRESHOLD; // 1.0
         let exploration = crate::SAMPLING_EXPLORATION; // 0.01
 
         // Test data
@@ -1427,10 +1620,26 @@ mod tests {
 
         // Verify the formula produces expected results
         // With POLICY_MIN being essentially 0, sum ≈ 1.5, denom ≈ 1.7
-        assert!((expected_1 - 0.2941176).abs() < 1e-5, "Formula check 1: {}", expected_1);
-        assert!((expected_2 - 0.5294118).abs() < 1e-5, "Formula check 2: {}", expected_2);
-        assert!((expected_3 - 0.4117647).abs() < 1e-5, "Formula check 3: {}", expected_3);
-        assert!((expected_4 - 0.1176471).abs() < 1e-5, "Formula check 4: {}", expected_4);
+        assert!(
+            (expected_1 - 0.2941176).abs() < 1e-5,
+            "Formula check 1: {}",
+            expected_1
+        );
+        assert!(
+            (expected_2 - 0.5294118).abs() < 1e-5,
+            "Formula check 2: {}",
+            expected_2
+        );
+        assert!(
+            (expected_3 - 0.4117647).abs() < 1e-5,
+            "Formula check 3: {}",
+            expected_3
+        );
+        assert!(
+            (expected_4 - 0.1176471).abs() < 1e-5,
+            "Formula check 4: {}",
+            expected_4
+        );
     }
 
     /// Test that batch computation in explore_one produces correct weights
@@ -1455,9 +1664,9 @@ mod tests {
             let mut bucket = bucket_mutex.value().write();
 
             // Add test policies - using edge u8 values directly
-            bucket.push((2, (f16::from_f32(0.3), 0.0)));  // Edge::Fold = 2
-            bucket.push((4, (f16::from_f32(0.7), 0.0)));  // Edge::Call = 4
-            // Both the write lock and entry guard are dropped here
+            bucket.push((2, (f16::from_f32(0.3), 0.0))); // Edge::Fold = 2
+            bucket.push((4, (f16::from_f32(0.7), 0.0))); // Edge::Call = 4
+                                                         // Both the write lock and entry guard are dropped here
         }
 
         // Verify the internal computation logic
@@ -1473,12 +1682,20 @@ mod tests {
                     2 => {
                         found_fold = true;
                         // f16 has limited precision, so we need a larger epsilon
-                        assert!((f32::from(policy) - 0.3).abs() < 0.001, "Fold policy: {}", f32::from(policy));
+                        assert!(
+                            (f32::from(policy) - 0.3).abs() < 0.001,
+                            "Fold policy: {}",
+                            f32::from(policy)
+                        );
                     }
                     4 => {
                         found_call = true;
                         // f16 has limited precision, so we need a larger epsilon
-                        assert!((f32::from(policy) - 0.7).abs() < 0.001, "Call policy: {}", f32::from(policy));
+                        assert!(
+                            (f32::from(policy) - 0.7).abs() < 0.001,
+                            "Call policy: {}",
+                            f32::from(policy)
+                        );
                     }
                     _ => {}
                 }
@@ -1506,8 +1723,11 @@ mod tests {
         let expected_empty = (numer / denom).max(crate::SAMPLING_EXPLORATION);
 
         // Verify the calculation - with POLICY_MIN ≈ 0, expected_empty ≈ 1.0
-        assert!((expected_empty - 1.0).abs() < 1e-5,
-            "Empty bucket calculation: {}", expected_empty);
+        assert!(
+            (expected_empty - 1.0).abs() < 1e-5,
+            "Empty bucket calculation: {}",
+            expected_empty
+        );
 
         // Test case 2: With policies
         let p1 = 0.4f32;
@@ -1515,19 +1735,31 @@ mod tests {
         let sum_with_policies = p1 + p2 + crate::POLICY_MIN; // ≈ 1.0
         let denom_with_policies = crate::SAMPLING_ACTIVATION + sum_with_policies; // ≈ 1.2
 
-        let expected_p1 = ((crate::SAMPLING_ACTIVATION + p1 * crate::SAMPLING_THRESHOLD) / denom_with_policies)
+        let expected_p1 = ((crate::SAMPLING_ACTIVATION + p1 * crate::SAMPLING_THRESHOLD)
+            / denom_with_policies)
             .max(crate::SAMPLING_EXPLORATION);
-        let expected_p2 = ((crate::SAMPLING_ACTIVATION + p2 * crate::SAMPLING_THRESHOLD) / denom_with_policies)
+        let expected_p2 = ((crate::SAMPLING_ACTIVATION + p2 * crate::SAMPLING_THRESHOLD)
+            / denom_with_policies)
             .max(crate::SAMPLING_EXPLORATION);
 
         // Verify relative ordering
-        assert!(expected_p2 > expected_p1, "Higher policy should produce higher sampling probability");
+        assert!(
+            expected_p2 > expected_p1,
+            "Higher policy should produce higher sampling probability"
+        );
 
         // With POLICY_MIN being essentially 0, we need different assertions
         // expected_p1 ≈ (0.2 + 0.4) / 1.2 ≈ 0.5
         // expected_p2 ≈ (0.2 + 0.6) / 1.2 ≈ 0.667
-        assert!((expected_p1 - 0.5).abs() < 1e-5, "Expected p1: {}", expected_p1);
-        assert!((expected_p2 - 0.6666667).abs() < 1e-5, "Expected p2: {}", expected_p2);
+        assert!(
+            (expected_p1 - 0.5).abs() < 1e-5,
+            "Expected p1: {}",
+            expected_p1
+        );
+        assert!(
+            (expected_p2 - 0.6666667).abs() < 1e-5,
+            "Expected p2: {}",
+            expected_p2
+        );
     }
 }
-

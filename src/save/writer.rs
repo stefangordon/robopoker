@@ -8,6 +8,7 @@ use crate::mccfr::nlhe::encoder::Encoder;
 use crate::mccfr::nlhe::profile::Profile;
 use byteorder::ReadBytesExt;
 use byteorder::BE;
+use futures::pin_mut;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Read;
@@ -18,7 +19,6 @@ use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::Client;
 use tokio_postgres::Error as E;
-use futures::pin_mut;
 use zstd::stream::Decoder as ZDecoder;
 
 pub struct Writer(Arc<Client>);
@@ -38,21 +38,19 @@ impl Writer {
         // - Use unlogged tables during load (converted to logged after)
         postgres
             .0
-            .batch_execute(
-                "SET synchronous_commit = OFF;",
-            )
+            .batch_execute("SET synchronous_commit = OFF;")
             .await?;
 
         // Upload in dependency order
         postgres.upload::<Metric>().await?;
         postgres.upload::<Decomp>().await?;
         postgres.upload::<Encoder>().await?;
-        postgres.upload::<Profile>().await?;  // This is the slow one
-        
+        postgres.upload::<Profile>().await?; // This is the slow one
+
         // Derive tables
         postgres.derive::<Abstraction>().await?;
         postgres.derive::<Street>().await?;
-        
+
         // Analyze tables
         postgres.0.batch_execute("VACUUM ANALYZE;").await?;
         Ok(())
@@ -70,22 +68,23 @@ impl Writer {
         }
         if self.vacant(name).await? {
             log::info!("copying {}", name);
-            
+
             // Use optimized stream for blueprint table
             if name == "blueprint" {
                 self.stream_optimized::<T>().await?;
             } else {
-            self.stream::<T>().await?;
+                self.stream::<T>().await?;
             }
-            
+
             // Create indices CONCURRENTLY for large tables to avoid locking
             if name == "blueprint" || name == "isomorphism" {
                 log::info!("creating indices for {} (this may take a while)", name);
                 // Parse and execute each index creation separately for CONCURRENTLY support
                 for index_stmt in T::indices().split(';').filter(|s| !s.trim().is_empty()) {
-                    let concurrent_stmt = index_stmt
-                        .trim()
-                        .replace("CREATE INDEX IF NOT EXISTS", "CREATE INDEX CONCURRENTLY IF NOT EXISTS");
+                    let concurrent_stmt = index_stmt.trim().replace(
+                        "CREATE INDEX IF NOT EXISTS",
+                        "CREATE INDEX CONCURRENTLY IF NOT EXISTS",
+                    );
                     if concurrent_stmt.contains("CREATE INDEX") {
                         // Execute index creation with lower priority
                         self.0.batch_execute("SET vacuum_cost_delay = 10;").await?;
@@ -96,7 +95,7 @@ impl Writer {
                     }
                 }
             } else {
-            self.0.batch_execute(&T::indices()).await?;
+                self.0.batch_execute(&T::indices()).await?;
             }
             Ok(())
         } else {
@@ -135,7 +134,7 @@ impl Writer {
         pin_mut!(writer);
 
         // Much larger batch size for blueprint table
-        const LARGE_BATCH: usize = 50_000;  // Increased from 8,192
+        const LARGE_BATCH: usize = 50_000; // Increased from 8,192
         let cols = T::columns().len();
         let mut buffer: Vec<Vec<Field>> = Vec::with_capacity(LARGE_BATCH);
 
@@ -147,13 +146,13 @@ impl Writer {
 
         for src in T::sources() {
             log::info!("Processing source file: {}", src);
-            
+
             // Detect compression
             let mut magic = [0u8; 4];
             let mut file_for_magic = File::open(&src).expect("file not found");
             let _ = file_for_magic.read_exact(&mut magic);
             file_for_magic.seek(SeekFrom::Start(0)).unwrap();
-            
+
             // Use larger buffer for reading
             let reader_inner: Box<dyn Read> = if magic == [0x28, 0xB5, 0x2F, 0xFD] {
                 log::debug!("Detected zstd compression");
@@ -162,10 +161,10 @@ impl Writer {
                 log::debug!("Using uncompressed file");
                 Box::new(file_for_magic)
             };
-            
+
             // Increase buffer size for better I/O performance
             let mut reader = BufReader::with_capacity(4 * 1024 * 1024, reader_inner);
-            
+
             // Skip PostgreSQL header
             let mut skip = [0u8; 19];
             reader.read_exact(&mut skip).expect("skip pgcopy header");
@@ -184,7 +183,11 @@ impl Writer {
                     // Skip invalid row
                     for _ in 0..fields {
                         let len = reader.read_u32::<BE>().unwrap_or(0);
-                        reader.by_ref().take(len as u64).read_to_end(&mut Vec::new()).ok();
+                        reader
+                            .by_ref()
+                            .take(len as u64)
+                            .read_to_end(&mut Vec::new())
+                            .ok();
                     }
                     continue;
                 }
@@ -215,7 +218,7 @@ impl Writer {
                         writer.as_mut().write_raw(row.iter()).await?;
                     }
                     buffer.clear();
-                    
+
                     // Enhanced progress logging
                     let now = std::time::Instant::now();
                     if now.duration_since(last_log_time).as_secs() >= 5 {
@@ -225,7 +228,7 @@ impl Writer {
                             "COPY progress: {} rows ({:.0} rows/sec, {:.1} MB/sec)",
                             total_rows,
                             rows_per_sec,
-                            (rows_per_sec * 40.0) / 1_048_576.0  // 40 bytes per row
+                            (rows_per_sec * 40.0) / 1_048_576.0 // 40 bytes per row
                         );
                         last_log_time = now;
                     }
@@ -239,7 +242,7 @@ impl Writer {
         }
 
         writer.finish().await?;
-        
+
         let elapsed = start_time.elapsed().as_secs_f64();
         log::info!(
             "COPY completed: {} total rows in {:.1}s ({:.0} rows/sec)",
@@ -247,7 +250,7 @@ impl Writer {
             elapsed,
             total_rows as f64 / elapsed
         );
-        
+
         Ok(())
     }
 
@@ -274,7 +277,7 @@ impl Writer {
             let mut file_for_magic = File::open(&src).expect("file not found");
             let _ = file_for_magic.read_exact(&mut magic);
             file_for_magic.seek(SeekFrom::Start(0)).unwrap();
-            
+
             let reader_inner: Box<dyn Read> = if magic == [0x28, 0xB5, 0x2F, 0xFD] {
                 log::debug!("Detected zstd compression in file: {}", src);
                 Box::new(ZDecoder::new(file_for_magic).expect("zstd decode"))
@@ -282,9 +285,9 @@ impl Writer {
                 log::debug!("Using uncompressed file: {}", src);
                 Box::new(file_for_magic)
             };
-            
+
             let mut reader = BufReader::new(reader_inner);
-            
+
             // Skip PostgreSQL header
             let mut skip = [0u8; 19];
             reader.read_exact(&mut skip).expect("skip pgcopy header");
@@ -303,7 +306,11 @@ impl Writer {
                     // Skip invalid row
                     for _ in 0..fields {
                         let len = reader.read_u32::<BE>().unwrap_or(0);
-                        reader.by_ref().take(len as u64).read_to_end(&mut Vec::new()).ok();
+                        reader
+                            .by_ref()
+                            .take(len as u64)
+                            .read_to_end(&mut Vec::new())
+                            .ok();
                     }
                     continue;
                 }
@@ -332,7 +339,7 @@ impl Writer {
                         writer.as_mut().write_raw(row.iter()).await?;
                     }
                     buffer.clear();
-                    
+
                     batch_count += 1;
                     if batch_count % 100 == 0 {
                         log::info!("COPY progress: {} batches processed", batch_count);

@@ -3,10 +3,10 @@ use super::hand::Hand;
 use super::kicks::Kickers;
 use super::rank::Rank;
 use super::ranking::Ranking;
-use std::sync::OnceLock;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// A faster 7-card hand evaluator backed by a pre-computed lookup table.
 ///
@@ -149,7 +149,10 @@ fn load_or_generate_table() -> Vec<u16> {
         log::info!("loading 7-card evaluator table from {}", path.display());
         load_table(&path)
     } else {
-        log::warn!("evaluator table not found – generating at {} (this may take a while)", path.display());
+        log::warn!(
+            "evaluator table not found – generating at {} (this may take a while)",
+            path.display()
+        );
         let table = generate_table();
         save_table(&path, &table);
         table
@@ -183,8 +186,8 @@ fn save_table(path: &PathBuf, table: &[u16]) {
 }
 
 fn generate_table() -> Vec<u16> {
-    use crate::cards::hands::HandIterator;
     use crate::cards::evaluator::Evaluator;
+    use crate::cards::hands::HandIterator;
 
     let mut table = vec![0u16; TOTAL_COMBOS];
     let mut processed: usize = 0;
@@ -217,7 +220,11 @@ mod tests {
         for (i, hand) in iter.by_ref().take(SAMPLE).enumerate() {
             let lookup_rank = LookupEvaluator::from(hand).find_ranking();
             let original_rank = Evaluator::from(hand).find_ranking();
-            assert_eq!(lookup_rank, original_rank, "Mismatch at sample {} for hand {}", i, hand);
+            assert_eq!(
+                lookup_rank, original_rank,
+                "Mismatch at sample {} for hand {}",
+                i, hand
+            );
         }
     }
 

@@ -2,11 +2,11 @@ use super::edge::Edge;
 use super::game::Game;
 use super::solver::RPS;
 use super::turn::Turn;
+use crate::gameplay::game::Game as GameplayGame;
+use crate::gameplay::odds::Odds;
+use crate::mccfr::nlhe::encoder::BetSizer;
 use crate::mccfr::structs::tree::Tree;
 use crate::mccfr::types::branch::Branch;
-use crate::mccfr::nlhe::encoder::BetSizer;
-use crate::gameplay::odds::Odds;
-use crate::gameplay::game::Game as GameplayGame;
 
 /// RPS doesn't need bet sizing since it's a simple game with fixed actions
 pub struct RPSSizer;

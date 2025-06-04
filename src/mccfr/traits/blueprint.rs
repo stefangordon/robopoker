@@ -97,8 +97,7 @@ pub trait Blueprint: Send + Sync {
             let prev = self.profile().sum_regret(info, edge);
             let accumulated = {
                 let discounted = prev * self.discount(Some(prev));
-                (discounted + regret)
-                    .clamp(crate::REGRET_MIN, crate::REGRET_MAX)
+                (discounted + regret).clamp(crate::REGRET_MIN, crate::REGRET_MAX)
             };
             *self.mut_regret(info, edge) = accumulated;
         }

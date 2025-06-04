@@ -198,9 +198,9 @@ async fn hst_wrt_obs(api: web::Data<API>, req: web::Json<ObsHist>) -> impl Respo
 }
 
 async fn lookup_policy(
-    api: web::Data<API>, 
+    api: web::Data<API>,
     req: web::Json<GetPolicy>,
-    query: web::Query<PolicyQueryParams>
+    query: web::Query<PolicyQueryParams>,
 ) -> impl Responder {
     let hero = Turn::try_from(req.hero.as_str());
     let seen = Observation::try_from(req.seen.as_str());
@@ -209,12 +209,15 @@ async fn lookup_policy(
         .iter()
         .map(|s| Action::try_from(s.as_str()))
         .collect::<Result<Vec<_>, _>>();
-    
+
     let disable_subgames = query.disable_subgames.unwrap_or(false);
-    
+
     match (hero, seen, path) {
         (Ok(hero), Ok(seen), Ok(path)) => {
-            match api.policy_with_options(Recall::from((hero, seen, path)), disable_subgames).await {
+            match api
+                .policy_with_options(Recall::from((hero, seen, path)), disable_subgames)
+                .await
+            {
                 Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
                 Ok(rows) => HttpResponse::Ok().json(rows),
             }

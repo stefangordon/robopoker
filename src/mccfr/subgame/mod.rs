@@ -36,8 +36,8 @@ mod solver;
 pub use solver::{SubgameSolver, SubgameSolverBuilder};
 
 // Re-export types needed by subgame solving
-use crate::mccfr::nlhe::{Game};
 use crate::gameplay::odds::Odds;
+use crate::mccfr::nlhe::Game;
 
 // Internal use only
 use crate::mccfr::nlhe::encoder::BetSizer;
@@ -70,9 +70,9 @@ pub struct SubgameParams {
 impl Default for SubgameParams {
     fn default() -> Self {
         Self {
-            regret_min: -1.0e7,  // looser bounds than global -3e5
-            regret_max:  1.0e7,
-            sampling_eps: 1e-6,  // floor to stabilise importance weights
+            regret_min: -1.0e7, // looser bounds than global -3e5
+            regret_max: 1.0e7,
+            sampling_eps: 1e-6, // floor to stabilise importance weights
         }
     }
 }

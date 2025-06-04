@@ -38,6 +38,9 @@ async fn main() {
     if arguments.convert_blueprint_to_parquet {
         crate::save::Converter::convert_blueprint_to_parquet();
     }
+    if arguments.genmodeldata {
+        crate::modeldata::generate_model_data();
+    }
 }
 
 /*

@@ -111,12 +111,12 @@ fn solving_cfr_rps(c: &mut criterion::Criterion) {
 
 #[cfg(feature = "native")]
 fn saving_profile_blueprint(c: &mut criterion::Criterion) {
+    use robopoker::cards::street::Street;
+    use robopoker::mccfr::nlhe::profile::Profile;
+    use robopoker::save::disk::Disk;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
-    use robopoker::save::disk::Disk;
-    use robopoker::mccfr::nlhe::profile::Profile;
-    use robopoker::cards::street::Street;
     use std::time::Instant;
 
     c.bench_function("save profile blueprint", |b| {
@@ -128,7 +128,8 @@ fn saving_profile_blueprint(c: &mut criterion::Criterion) {
         profile.populate_dummy(1_000_000, 4);
 
         // Create a temporary directory for the save
-        let temp_dir = PathBuf::from(std::env::var("USERPROFILE").unwrap()).join("pgcopy_benchmark");
+        let temp_dir =
+            PathBuf::from(std::env::var("USERPROFILE").unwrap()).join("pgcopy_benchmark");
 
         // Ensure all parent directories exist
         fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");

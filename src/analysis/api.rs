@@ -7,23 +7,23 @@ use crate::clustering::histogram::Histogram;
 use crate::clustering::metric::Metric;
 use crate::clustering::pair::Pair;
 use crate::clustering::sinkhorn::Sinkhorn;
-use crate::gameplay::path::Path;
 use crate::gameplay::game::Game;
+use crate::gameplay::path::Path;
+use crate::gameplay::recall::Recall;
+use crate::mccfr::nlhe::encoder::BlueprintEncoder;
+use crate::mccfr::nlhe::encoder::Encoder as NLHEEncoder;
+use crate::mccfr::subgame::SubgameSizer;
+use crate::mccfr::types::decision::Decision;
+use crate::save::disk::Disk;
 use crate::transport::coupling::Coupling;
+use crate::Chips;
 use crate::Energy;
 use crate::Probability;
-use crate::Chips;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_postgres::Client;
 use tokio_postgres::Error as E;
-use crate::mccfr::nlhe::encoder::BlueprintEncoder;
-use crate::mccfr::nlhe::encoder::Encoder as NLHEEncoder;
-use crate::mccfr::subgame::SubgameSizer;
-use crate::save::disk::Disk;
-use crate::mccfr::types::decision::Decision;
-use crate::gameplay::recall::Recall;
 
 pub struct API {
     client: Arc<Client>,
@@ -157,7 +157,11 @@ impl API {
             FROM metric m
             WHERE $1 = m.xor;
         "#;
-        Ok(self.client.query_one(SQL, &[&xor]).await?.get::<_, Energy>(0))
+        Ok(self
+            .client
+            .query_one(SQL, &[&xor])
+            .await?
+            .get::<_, Energy>(0))
     }
     pub async fn obs_distance(&self, obs1: Observation, obs2: Observation) -> Result<Energy, E> {
         if obs1.street() != obs2.street() {
@@ -816,7 +820,11 @@ impl API {
         self.policy_with_options(recall, false).await
     }
 
-    pub async fn policy_with_options(&self, recall: Recall, disable_subgames: bool) -> Result<Vec<Decision>, E> {
+    pub async fn policy_with_options(
+        &self,
+        recall: Recall,
+        disable_subgames: bool,
+    ) -> Result<Vec<Decision>, E> {
         let game = recall.head();
         let street = game.street();
         let pot = game.pot();
@@ -826,10 +834,16 @@ impl API {
         }
 
         // Check if we should solve a subgame for this situation (unless disabled)
-        if !disable_subgames && self.should_solve_subgame(street, pot, Self::stack_to_pot_ratio(&game, recall.hero_position())) {
+        if !disable_subgames
+            && self.should_solve_subgame(
+                street,
+                pot,
+                Self::stack_to_pot_ratio(&game, recall.hero_position()),
+            )
+        {
             // Attempt to get blueprint policy for warm-starting.
             let warm_start_strategy = self.blueprint_policy(&recall, true).await.unwrap_or(None);
-            
+
             // If blueprint lookup fails, try a fallback strategy for warm start
             let effective_warm_start = if warm_start_strategy.is_none() {
                 log::debug!("Blueprint miss for warm start, trying fallback strategy");
@@ -837,20 +851,24 @@ impl API {
             } else {
                 warm_start_strategy
             };
-            
-            return self.solve_subgame_unsafe(&recall, effective_warm_start).await;
+
+            return self
+                .solve_subgame_unsafe(&recall, effective_warm_start)
+                .await;
         }
 
         // Otherwise use existing blueprint lookup
-        self.blueprint_policy(&recall, false).await.map(|opt_vec| opt_vec.unwrap_or_default())
+        self.blueprint_policy(&recall, false)
+            .await
+            .map(|opt_vec| opt_vec.unwrap_or_default())
     }
 
     /// Determine if we should solve a subgame for this situation
     fn should_solve_subgame(&self, street: Street, pot: Chips, spr: f32) -> bool {
         match street {
-            Street::Rive => pot > 20, // Always solve river in big pots
+            Street::Rive => pot > 20,              // Always solve river in big pots
             Street::Turn => pot > 40 && spr < 2.0, // Solve turn in very big pots
-            _ => false, // Don't solve preflop/flop
+            _ => false,                            // Don't solve preflop/flop
         }
     }
 
@@ -874,7 +892,7 @@ impl API {
     /// Generate a fallback warm start strategy when blueprint lookup fails
     async fn fallback_warm_start_strategy(&self, game: &Game) -> Option<Vec<Decision>> {
         use crate::gameplay::edge::Edge;
-        
+
         // Create a reasonable default strategy based on game state
         let legal_actions = game.legal();
         if legal_actions.is_empty() {
@@ -882,47 +900,65 @@ impl API {
         }
 
         // Convert actions to edges and create a balanced strategy
-        let edges: Vec<Edge> = legal_actions.iter().map(|action| game.edgify(*action)).collect();
+        let edges: Vec<Edge> = legal_actions
+            .iter()
+            .map(|action| game.edgify(*action))
+            .collect();
         let n = edges.len() as f32;
-        
+
         // Create a slightly more realistic strategy than uniform:
         // - Favor checking/calling over folding
         // - Moderate aggression
-        let strategy: Vec<Decision> = edges.into_iter().map(|edge| {
-            let weight = match edge {
-                Edge::Fold => 0.1,      // Low fold frequency
-                Edge::Check => 0.4,     // Prefer checking when possible
-                Edge::Call => 0.3,      // Moderate calling
-                Edge::Raise(_) => 0.15,  // Some aggression
-                Edge::Shove => 0.05,    // Conservative with all-ins
-                Edge::Draw => 1.0,      // Always deal when required
-            };
-            Decision::from((edge, weight))
-        }).collect();
+        let strategy: Vec<Decision> = edges
+            .into_iter()
+            .map(|edge| {
+                let weight = match edge {
+                    Edge::Fold => 0.1,      // Low fold frequency
+                    Edge::Check => 0.4,     // Prefer checking when possible
+                    Edge::Call => 0.3,      // Moderate calling
+                    Edge::Raise(_) => 0.15, // Some aggression
+                    Edge::Shove => 0.05,    // Conservative with all-ins
+                    Edge::Draw => 1.0,      // Always deal when required
+                };
+                Decision::from((edge, weight))
+            })
+            .collect();
 
         // Normalize weights
         let total_weight: f32 = strategy.iter().map(|d| d.weight()).sum();
         if total_weight > 0.0 {
-            let normalized_strategy: Vec<Decision> = strategy.into_iter().map(|d| {
-                Decision::from((d.edge(), d.weight() / total_weight))
-            }).collect();
-            
-            log::debug!("Generated fallback warm start with {} actions", normalized_strategy.len());
+            let normalized_strategy: Vec<Decision> = strategy
+                .into_iter()
+                .map(|d| Decision::from((d.edge(), d.weight() / total_weight)))
+                .collect();
+
+            log::debug!(
+                "Generated fallback warm start with {} actions",
+                normalized_strategy.len()
+            );
             Some(normalized_strategy)
         } else {
             // Last resort: uniform strategy
             let uniform_weight = 1.0 / n;
-            let uniform_strategy: Vec<Decision> = legal_actions.iter().map(|action| {
-                Decision::from((game.edgify(*action), uniform_weight))
-            }).collect();
-            
-            log::debug!("Generated uniform fallback warm start with {} actions", uniform_strategy.len());
+            let uniform_strategy: Vec<Decision> = legal_actions
+                .iter()
+                .map(|action| Decision::from((game.edgify(*action), uniform_weight)))
+                .collect();
+
+            log::debug!(
+                "Generated uniform fallback warm start with {} actions",
+                uniform_strategy.len()
+            );
             Some(uniform_strategy)
         }
     }
 
     /// Solve a subgame with enhanced action abstraction
-    async fn solve_subgame_unsafe(&self, recall: &Recall, warm_start_strategy: Option<Vec<Decision>>) -> Result<Vec<Decision>, E> {
+    async fn solve_subgame_unsafe(
+        &self,
+        recall: &Recall,
+        warm_start_strategy: Option<Vec<Decision>>,
+    ) -> Result<Vec<Decision>, E> {
         use crate::mccfr::subgame::SubgameSolver;
 
         let game = recall.head();
@@ -952,7 +988,11 @@ impl API {
     }
 
     /// Original blueprint policy lookup (renamed from policy)
-    async fn blueprint_policy(&self, recall: &Recall, for_warm_start_only: bool) -> Result<Option<Vec<Decision>>, E> {
+    async fn blueprint_policy(
+        &self,
+        recall: &Recall,
+        for_warm_start_only: bool,
+    ) -> Result<Option<Vec<Decision>>, E> {
         const SQL: &'static str = r#"
         -- policy is indexed by present, past, future
         -- and it returns a vector of decision probabilities
@@ -992,10 +1032,18 @@ impl API {
         let ref history_val = i64::from(history);
         let ref present_val = i64::from(present);
         let ref futures_val = i64::from(futures);
-        let rows = self.client.query(SQL, &[history_val, present_val, futures_val]).await?;
+        let rows = self
+            .client
+            .query(SQL, &[history_val, present_val, futures_val])
+            .await?;
 
         if rows.is_empty() {
-            log::warn!("BP miss: past={} present={} future={} -> subgame", history_val, present_val, futures_val);
+            log::warn!(
+                "BP miss: past={} present={} future={} -> subgame",
+                history_val,
+                present_val,
+                futures_val
+            );
             if for_warm_start_only {
                 return Ok(None); // For warm-start, a miss means no strategy to provide
             } else {
@@ -1019,17 +1067,18 @@ impl API {
         }
 
         let decisions: Vec<Decision> = rows.into_iter().map(Decision::from).collect();
-        
+
         // Normalize the policy weights to sum to 1.0 (same as blueprint does)
         let total_weight: f32 = decisions.iter().map(|d| d.weight()).sum();
         let normalized_decisions = if total_weight > 0.0 {
-            decisions.into_iter().map(|d| {
-                Decision::from((d.edge(), d.weight() / total_weight))
-            }).collect()
+            decisions
+                .into_iter()
+                .map(|d| Decision::from((d.edge(), d.weight() / total_weight)))
+                .collect()
         } else {
             decisions
         };
-        
+
         Ok(Some(normalized_decisions))
     }
 }

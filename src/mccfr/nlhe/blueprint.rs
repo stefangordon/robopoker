@@ -1,8 +1,8 @@
 use crate::mccfr::traits::blueprint::Blueprint;
 use crate::mccfr::traits::profile::Profile;
 use crate::save::disk::Disk;
-use rustc_hash::FxHashMap;
 use half::f16;
+use rustc_hash::FxHashMap;
 
 impl Blueprint for super::solver::NLHE {
     type T = super::turn::Turn;
@@ -76,10 +76,10 @@ impl Blueprint for super::solver::NLHE {
                 progress.inc(1);
                 if last_checkpoint.elapsed() >= checkpoint_interval {
                     self.profile.save();
-                    
+
                     // Also log stats during checkpoint
                     self.profile.log_stats();
-                    
+
                     last_checkpoint = Instant::now();
                     log::info!(
                         "Checkpoint saved after {} elapsed hours (iteration {})",

@@ -1,6 +1,8 @@
 #[cfg(all(feature = "native", feature = "subgame"))]
 pub mod analysis;
 #[cfg(feature = "native")]
+pub mod modeldata;
+#[cfg(feature = "native")]
 pub mod players;
 #[cfg(feature = "native")]
 pub mod save;
@@ -67,7 +69,6 @@ mod kmeans_constants {
 
 use kmeans_constants::*;
 
-
 /// rps mccfr parameteres
 const ASYMMETRIC_UTILITY: f32 = 2.0;
 const CFR_BATCH_SIZE_RPS: usize = 1;
@@ -118,6 +119,9 @@ pub struct Args {
     /// Convert blueprint to Parquet format
     #[arg(long)]
     pub convert_blueprint_to_parquet: bool,
+    /// Generate model training data in Parquet format
+    #[arg(long)]
+    pub genmodeldata: bool,
 }
 
 /// trait for random generation, mainly (strictly?) for testing
@@ -131,7 +135,8 @@ pub fn progress(n: usize) -> indicatif::ProgressBar {
     let tick = std::time::Duration::from_secs(60);
     // Show items per second throughput in addition to elapsed time, percent and bar.
     // The long tick interval (60s) limits redraw frequency to reduce overhead.
-    let style = "{spinner:.cyan} [{pos}/{len}] {elapsed} @ {per_sec:>12} ~ {percent:>3}% {wide_bar:.cyan}";
+    let style =
+        "{spinner:.cyan} [{pos}/{len}] {elapsed} @ {per_sec:>12} ~ {percent:>3}% {wide_bar:.cyan}";
     let style = indicatif::ProgressStyle::with_template(style).unwrap();
     let progress = indicatif::ProgressBar::new(n as u64);
     progress.set_style(style);

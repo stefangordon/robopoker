@@ -1,17 +1,17 @@
 use crate::cards::card::Card;
+use crate::cards::deck::Deck;
+use crate::cards::hand::Hand;
 use crate::cards::hole::Hole;
 use crate::cards::isomorphism::Isomorphism;
 use crate::cards::observation::Observation;
 use crate::gameplay::action::Action;
+use crate::gameplay::edge::Edge;
 use crate::gameplay::game::Game;
+use crate::gameplay::odds::Odds;
 use crate::gameplay::path::Path;
 use crate::gameplay::turn::Turn;
-use crate::cards::hand::Hand;
-use crate::cards::deck::Deck;
-use crate::gameplay::odds::Odds;
 use crate::mccfr::nlhe::encoder::BlueprintEncoder;
 use crate::Chips;
-use crate::gameplay::edge::Edge;
 
 /// a complete representation of perfect recall game history
 /// from the perspective of the hero. intended use is for
@@ -52,7 +52,8 @@ impl IntoIterator for Recall {
         game_states.push(root_game);
 
         let mut current_game_state = root_game;
-        for action_from_path in self.path { // self.path here is Vec<Action> from Recall struct
+        for action_from_path in self.path {
+            // self.path here is Vec<Action> from Recall struct
             current_game_state = current_game_state.apply(action_from_path);
             game_states.push(current_game_state);
         }
@@ -127,7 +128,7 @@ impl Recall {
         // Get the hero's position
         let hero_idx = match self.hero {
             Turn::Choice(idx) => idx,
-            _ => 0  // Default to position 0 if hero isn't a player position
+            _ => 0, // Default to position 0 if hero isn't a player position
         };
 
         // Start with a basic game
@@ -143,7 +144,9 @@ impl Recall {
         // Get a fresh deck and remove all observed cards
         let deck = Deck::new();
         // Create a new deck that doesn't contain the observed cards
-        let mut filtered_deck = Deck::from(Hand::from(u64::from(Hand::from(deck)) & !(u64::from(observed_cards))));
+        let mut filtered_deck = Deck::from(Hand::from(
+            u64::from(Hand::from(deck)) & !(u64::from(observed_cards)),
+        ));
 
         // 3. For opponent seats, reset their cards to safe placeholder cards
         for i in 0..game.n() {
@@ -201,7 +204,8 @@ impl Recall {
 
                     // Snap amount to exact grid bet so game state matches blueprint expectation
                     use crate::Probability;
-                    let snapped_amount = ((Probability::from(odds) * game.pot() as f32).round()) as Chips;
+                    let snapped_amount =
+                        ((Probability::from(odds) * game.pot() as f32).round()) as Chips;
                     action_for_game = Action::Raise(snapped_amount.max(game.to_raise()));
                     log::debug!(
                         "ENCODE raise  | amount={} pot={} depth={} odds={:?} edge={:?}",

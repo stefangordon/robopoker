@@ -2,10 +2,10 @@ use super::edge::Edge;
 use super::game::Game;
 use super::info::Info;
 use super::turn::Turn;
+use crate::mccfr::nlhe::encoder::BetSizer;
 use crate::mccfr::structs::node::Node;
 use crate::mccfr::structs::tree::Tree;
 use crate::mccfr::types::branch::Branch;
-use crate::mccfr::nlhe::encoder::BetSizer;
 
 /// infoset encoding is fully abstracted. it must be implemented
 /// by the consumer of this MCCFR API.

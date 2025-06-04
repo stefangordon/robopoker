@@ -73,11 +73,9 @@ impl Odds {
 
     #[cfg(feature = "shortdeck")]
     pub const PREF_RAISES: [Self; 5] = [
-        Self(1, 4), // 0.25
         Self(1, 2), // 0.50
         Self(1, 1), // 1.00
         Self(2, 1), // 2.00
-        Self(4, 1), // 4.00
     ];
 
     #[cfg(not(feature = "shortdeck"))]

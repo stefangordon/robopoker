@@ -4,10 +4,10 @@ use crate::cards::observation::Observation;
 use crate::cards::street::Street;
 use crate::clustering::abstraction::Abstraction;
 use crate::clustering::histogram::Histogram;
+use crate::save::disk::Disk;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use crate::save::disk::Disk;
 
 #[derive(Default)]
 /// this is the grand lookup table for all the Isomorphism -> Abstraction
@@ -108,7 +108,7 @@ impl crate::save::disk::Disk for Lookup {
     fn load(street: Street) -> Self {
         let ref path = Self::path(street);
         log::info!("{:<32}{:<32}", "loading     lookup", path);
-        use byteorder::{BE, ReadBytesExt};
+        use byteorder::{ReadBytesExt, BE};
         use std::fs::File;
         use std::io::BufReader;
         use std::io::Read;
@@ -141,10 +141,10 @@ impl crate::save::disk::Disk for Lookup {
         let street = self.street();
         let ref path = Self::path(street);
         let ref mut file = File::create(path).expect(&format!("touch {}", path));
-        use byteorder::{BE, WriteBytesExt};
+        use byteorder::{WriteBytesExt, BE};
         use std::fs::File;
-        use std::io::Write;
         use std::io::BufWriter;
+        use std::io::Write;
         use std::mem::size_of;
         // Use a large buffer (4 MB) for faster writes
         const BUF: usize = 4 * 1024 * 1024;
@@ -170,12 +170,16 @@ static FLOP_LOOKUP: OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>> = OnceLock
 static TURN_LOOKUP: OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>> = OnceLock::new();
 static RIVE_LOOKUP: OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>> = OnceLock::new();
 
-fn init_lookup(cell: &OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>>, street: Street) -> Arc<BTreeMap<Isomorphism, Abstraction>> {
+fn init_lookup(
+    cell: &OnceLock<Arc<BTreeMap<Isomorphism, Abstraction>>>,
+    street: Street,
+) -> Arc<BTreeMap<Isomorphism, Abstraction>> {
     cell.get_or_init(|| {
         log::info!("loading abstraction lookup for {:?}", street);
         let lookup: Lookup = <Lookup as Disk>::load(street);
         Arc::new(lookup.into())
-    }).clone()
+    })
+    .clone()
 }
 
 /// Retrieve a cached abstraction lookup for the given street.  Heavy files are

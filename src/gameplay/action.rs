@@ -113,7 +113,7 @@ impl TryFrom<&str> for Action {
             "CALL" => {
                 // Always use 0 for call amount - will be filled in later
                 Ok(Action::Call(0))
-            },
+            }
             "RAISE" => parts
                 .get(1)
                 .and_then(|n| n.parse().ok())
@@ -140,7 +140,7 @@ impl TryFrom<&str> for Action {
                     // Use an empty hand - the game will derive the right cards
                     Ok(Action::Draw(Hand::empty()))
                 }
-            },
+            }
             _ => Err("invalid action type"),
         }
     }
