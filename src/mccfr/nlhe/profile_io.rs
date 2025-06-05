@@ -118,10 +118,7 @@ impl Profile {
             (total_infosets as f64 * sample_rate) as usize
         );
 
-        // Use deterministic sampling based on hash for reproducibility
-        let mut rng = StdRng::seed_from_u64(12345);
-
-        // Calculate expected sampled count for scaling without collecting
+                // Calculate expected sampled count for scaling without collecting
         let expected_sampled = if sample_rate < 1.0 {
             (total_infosets as f64 * sample_rate) as usize
         } else {
@@ -129,18 +126,20 @@ impl Profile {
         };
         let scaling_factor = total_infosets as f64 / expected_sampled as f64;
 
-                // Process entries directly without collecting into Vec to save ~96GB of memory
+                                // Process entries directly without collecting into Vec to save ~96GB of memory
         // For 12 billion entries, this saves approximately 96GB of RAM
-        use rayon::prelude::*;
+        use rayon::iter::ParallelBridge;
 
-                let final_stats = if sample_rate < 1.0 {
+        let final_stats = if sample_rate < 1.0 {
             // Use thread-local RNG for deterministic sampling
             use std::cell::RefCell;
             thread_local! {
                 static THREAD_RNG: RefCell<StdRng> = RefCell::new(StdRng::seed_from_u64(12345));
             }
 
-            (&self.encounters).into_par_iter()
+            // Use par_bridge to convert regular iterator to parallel
+            self.encounters.iter()
+                .par_bridge()
                 .filter(|_| {
                     THREAD_RNG.with(|rng| rng.borrow_mut().gen_bool(sample_rate))
                 })
@@ -304,7 +303,7 @@ impl Profile {
                     },
                 )
         } else {
-            (&self.encounters).into_par_iter()
+            self.encounters.iter().par_bridge()
                 .map(|bucket_entry| {
                     let mut stats = Stats::default();
 
@@ -863,9 +862,12 @@ impl Profile {
         // Share path so each thread can reopen the file independently
         let path_shared = Arc::new(path_str.clone());
 
-        // Build a dedicated 8-thread pool for loading
+        // Share schema across threads to avoid cloning
+        let schema_shared = Arc::new(schema.clone());
+
+        // Build a dedicated 4-thread pool for loading
         rayon::ThreadPoolBuilder::new()
-            .num_threads(8)
+            .num_threads(4)
             .build()
             .expect("Failed to build rayon pool")
             .install(|| {
@@ -878,13 +880,19 @@ impl Profile {
                         let file_handle = std::fs::File::open(&*path_shared)
                             .expect("Failed to reopen parquet file");
 
-                        let chunks = FileReader::new(
-                            file_handle,
+                        // Use buffered reader for better I/O performance
+                        let buffered_reader = std::io::BufReader::with_capacity(
+                            8 * 1024 * 1024, // 8MB buffer per thread
+                            file_handle
+                        );
+
+                                                let chunks = FileReader::new(
+                            buffered_reader,
                             vec![row_group.clone()],
-                            schema.clone(),
-                            None,
-                            None,
-                            None,
+                            schema_shared.as_ref().clone(),
+                            None, // projection - read all columns
+                            None, // limit
+                            None, // page filter - not using chunk size limit here due to API constraints
                         );
 
                         for chunk_result in chunks {
@@ -921,25 +929,33 @@ impl Profile {
 
                             let num_rows = chunk.len();
 
-                            for i in 0..num_rows {
-                                let history = Path::from(histories.value(i) as u64);
-                                let present = Abstraction::from(presents.value(i) as u64);
-                                let futures = Path::from(futures.value(i) as u64);
-                                let edge = Edge::from(edges.value(i) as u64);
-                                let regret = regrets.value(i);
-                                let policy = policies.value(i);
+                            // Process rows more efficiently in batches
+                            const BATCH_SIZE: usize = 1000;
+                            for batch_start in (0..num_rows).step_by(BATCH_SIZE) {
+                                let batch_end = (batch_start + BATCH_SIZE).min(num_rows);
 
-                                let info = Info::from((history, present, futures));
-                                let bucket_mutex = encounters
-                                    .entry(info)
-                                    .or_insert_with(|| RwLock::new(CompactBucket::new()));
-                                bucket_mutex
-                                    .value()
-                                    .write()
-                                    .push((u8::from(edge), (f16::from_f32(policy), regret)));
+                                for i in batch_start..batch_end {
+                                    let history = Path::from(histories.value(i) as u64);
+                                    let present = Abstraction::from(presents.value(i) as u64);
+                                    let futures = Path::from(futures.value(i) as u64);
+                                    let edge = Edge::from(edges.value(i) as u64);
+                                    let regret = regrets.value(i);
+                                    let policy = policies.value(i);
 
-                                processed_rows.fetch_add(1, Ordering::Relaxed);
-                                progress.inc(1);
+                                    let info = Info::from((history, present, futures));
+                                    let bucket_mutex = encounters
+                                        .entry(info)
+                                        .or_insert_with(|| RwLock::new(CompactBucket::new()));
+                                    bucket_mutex
+                                        .value()
+                                        .write()
+                                        .push((u8::from(edge), (f16::from_f32(policy), regret)));
+                                }
+
+                                // Update progress in batches to reduce overhead
+                                let batch_size = batch_end - batch_start;
+                                processed_rows.fetch_add(batch_size, Ordering::Relaxed);
+                                progress.inc(batch_size as u64);
                             }
                         }
                     });
