@@ -52,8 +52,8 @@ impl Profile {
     pub fn log_stats(&self) {
         use std::f32::{INFINITY, NEG_INFINITY};
 
-        // Hard cap at 100 million records to prevent excessive processing time
-        const MAX_RECORDS: usize = 100_000_000;
+        // Hard cap at 300 million records to prevent excessive processing time
+        const MAX_RECORDS: usize = 300_000_000;
 
         // Structure to hold stats
         struct Stats {
@@ -69,16 +69,172 @@ impl Profile {
             regret_buckets: [usize; 8],
             policy_buckets: [usize; 5],
             zero_regret_count: usize,
-            // Convergence metrics fields
+            // Convergence metrics
             near_zero_regrets: usize,
-            high_confidence_actions: usize,
-            total_entropy: f64,
+            positive_regrets_sum: f64,
+            positive_regrets_count: usize,
         }
 
-        // Constants for convergence metrics
-        const ZERO_THRESHOLD: f32 = 1.0;
-        const HIGH_CONFIDENCE_THRESHOLD: f32 = 0.9;
+        impl Default for Stats {
+            fn default() -> Self {
+                Self {
+                    infosets: 0,
+                    total_edges: 0,
+                    min_edges: usize::MAX,
+                    max_edges: 0,
+                    edge_count_dist: [0; 14],
+                    policy_min: INFINITY,
+                    policy_max: NEG_INFINITY,
+                    regret_min: INFINITY,
+                    regret_max: NEG_INFINITY,
+                    regret_buckets: [0; 8],
+                    policy_buckets: [0; 5],
+                    zero_regret_count: 0,
+                    near_zero_regrets: 0,
+                    positive_regrets_sum: 0.0,
+                    positive_regrets_count: 0,
+                }
+            }
+        }
 
+        impl Stats {
+            fn update_edge(&mut self, policy: f16, regret: f32) {
+                let pol_f32 = f32::from(policy);
+                self.policy_min = self.policy_min.min(pol_f32);
+                self.policy_max = self.policy_max.max(pol_f32);
+                self.regret_min = self.regret_min.min(regret);
+                self.regret_max = self.regret_max.max(regret);
+
+                // Near-zero and positive regret tracking
+                const ZERO_THRESHOLD: f32 = 1.0;
+                if regret.abs() < ZERO_THRESHOLD {
+                    self.near_zero_regrets += 1;
+                }
+                if regret > 0.0 {
+                    self.positive_regrets_sum += regret as f64;
+                    self.positive_regrets_count += 1;
+                }
+
+                // Bucket regrets
+                self.regret_buckets[Self::regret_bucket_index(regret)] += 1;
+                if regret == 0.0 {
+                    self.zero_regret_count += 1;
+                }
+
+                // Bucket policies
+                self.policy_buckets[Self::policy_bucket_index(pol_f32)] += 1;
+            }
+
+            fn regret_bucket_index(regret: f32) -> usize {
+                match regret {
+                    r if r < -1_000_000.0 => 0,
+                    r if r < -10_000.0 => 1,
+                    r if r < -100.0 => 2,
+                    r if r < 0.0 => 3,
+                    r if r < 100.0 => 4,
+                    r if r < 10_000.0 => 5,
+                    r if r < 1_000_000.0 => 6,
+                    _ => 7,
+                }
+            }
+
+            fn policy_bucket_index(policy: f32) -> usize {
+                match policy {
+                    p if p < 1.0 => 0,
+                    p if p < 10.0 => 1,
+                    p if p < 100.0 => 2,
+                    p if p < 1000.0 => 3,
+                    _ => 4,
+                }
+            }
+
+            fn print_summary(&self, processed: usize, total_infosets: usize) {
+                log::info!("------------------ BLUEPRINT STATS ------------------");
+                log::info!("NOTE: Statistics based on first {} of {} infosets", processed, total_infosets);
+                log::info!("InfoSets processed: {}", self.infosets);
+
+                let avg_edges = if self.infosets > 0 {
+                    self.total_edges as f64 / self.infosets as f64
+                } else { 0.0 };
+
+                log::info!(
+                    "Edges / set:   min {}  max {}  avg {:.2}",
+                    if self.min_edges == usize::MAX { 0 } else { self.min_edges },
+                    self.max_edges,
+                    avg_edges
+                );
+                log::info!("Policy range:  [{:.4}, {:.4}]", self.policy_min, self.policy_max);
+                log::info!("Regret range:  [{:.4}, {:.4}]", self.regret_min, self.regret_max);
+                log::info!(
+                    "Zero regrets:  {} ({:.2}% of edges)",
+                    self.zero_regret_count,
+                    100.0 * self.zero_regret_count as f64 / self.total_edges.max(1) as f64
+                );
+
+                // Regret distribution
+                log::info!("Regret distribution:");
+                const REGRET_LABELS: &[&str] = &[
+                    "< -1M", "[-1M, -10k)", "[-10k, -100)", "[-100, 0)",
+                    "[0, 100)", "[100, 10k)", "[10k, 1M)", ">= 1M"
+                ];
+                for (i, &count) in self.regret_buckets.iter().enumerate() {
+                    log::info!("  {:12} {} edges", format!("{}:", REGRET_LABELS[i]), count);
+                }
+
+                // Policy distribution
+                log::info!("Policy weight distribution:");
+                const POLICY_LABELS: &[&str] = &["[0, 1)", "[1, 10)", "[10, 100)", "[100, 1k)", ">= 1k"];
+                for (i, &count) in self.policy_buckets.iter().enumerate() {
+                    log::info!("  {:12} {} edges", format!("{}:", POLICY_LABELS[i]), count);
+                }
+
+                // Edge count distribution
+                log::info!("Edge count distribution:");
+                let mut cumulative = 0usize;
+                for (count, &freq) in self.edge_count_dist.iter().enumerate() {
+                    if freq > 0 {
+                        cumulative += freq;
+                        let pct = freq as f64 / self.infosets.max(1) as f64 * 100.0;
+                        let cum_pct = cumulative as f64 / self.infosets.max(1) as f64 * 100.0;
+                        log::info!(
+                            "  {} edges: {:>10} infosets ({:>5.1}%, cum {:>5.1}%)",
+                            count, freq, pct, cum_pct
+                        );
+                    }
+                }
+
+                // Convergence metrics
+                let convergence_ratio = if self.total_edges > 0 {
+                    self.near_zero_regrets as f64 / self.total_edges as f64 * 100.0
+                } else { 0.0 };
+
+                let mean_positive_regret = if self.positive_regrets_count > 0 {
+                    self.positive_regrets_sum / self.positive_regrets_count as f64
+                } else { 0.0 };
+
+                log::info!("Convergence metrics:");
+                log::info!("  Near-zero regrets: {:.1}%", convergence_ratio);
+                log::info!("  Mean positive regret: {:.2}", mean_positive_regret);
+                log::info!(
+                    "  Positive regrets: {} ({:.1}% of edges)",
+                    self.positive_regrets_count,
+                    100.0 * self.positive_regrets_count as f64 / self.total_edges.max(1) as f64
+                );
+
+                // Balance ratio
+                let negative_regrets: usize = self.regret_buckets[0..4].iter().sum();
+                let positive_regrets: usize = self.regret_buckets[4..].iter().sum();
+                let total_nonzero = negative_regrets + positive_regrets;
+                if total_nonzero > 0 {
+                    let balance_ratio = negative_regrets as f64 / total_nonzero as f64 * 100.0;
+                    log::info!("  Negative/Total ratio: {:.1}% (ideal ~50%)", balance_ratio);
+                }
+
+                log::info!("-----------------------------------------------------");
+            }
+        }
+
+        // Main processing
         let total_infosets = self.encounters.len();
         let process_limit = total_infosets.min(MAX_RECORDS);
 
@@ -89,27 +245,9 @@ impl Profile {
             (process_limit as f64 / total_infosets as f64) * 100.0
         );
 
-        // Initialize stats
-        let mut stats = Stats {
-            infosets: 0,
-            total_edges: 0,
-            min_edges: usize::MAX,
-            max_edges: 0,
-            edge_count_dist: [0; 14],
-            policy_min: INFINITY,
-            policy_max: NEG_INFINITY,
-            regret_min: INFINITY,
-            regret_max: NEG_INFINITY,
-            regret_buckets: [0; 8],
-            policy_buckets: [0; 5],
-            zero_regret_count: 0,
-            near_zero_regrets: 0,
-            high_confidence_actions: 0,
-            total_entropy: 0.0,
-        };
-
-        // Process records sequentially up to the limit
+        let mut stats = Stats::default();
         let mut processed = 0;
+
         for bucket_entry in self.encounters.iter() {
             if processed >= process_limit {
                 break;
@@ -124,195 +262,20 @@ impl Profile {
             stats.min_edges = stats.min_edges.min(count);
             stats.max_edges = stats.max_edges.max(count);
 
-            // Track edge count distribution
             if count < stats.edge_count_dist.len() {
                 stats.edge_count_dist[count] += 1;
             }
 
-            // For convergence metrics calculation
-            let mut weights: Vec<f32> = Vec::with_capacity(count);
-
             for (_, (policy, regret)) in bucket.iter() {
-                let pol_f32 = f32::from(policy);
-                stats.policy_min = stats.policy_min.min(pol_f32);
-                stats.policy_max = stats.policy_max.max(pol_f32);
-                stats.regret_min = stats.regret_min.min(regret);
-                stats.regret_max = stats.regret_max.max(regret);
-
-                // Count near-zero regrets
-                if regret.abs() < ZERO_THRESHOLD {
-                    stats.near_zero_regrets += 1;
-                }
-
-                // Bucket regrets
-                if regret == 0.0 {
-                    stats.zero_regret_count += 1;
-                } else if regret < -1_000_000.0 {
-                    stats.regret_buckets[0] += 1;
-                } else if regret < -10_000.0 {
-                    stats.regret_buckets[1] += 1;
-                } else if regret < -100.0 {
-                    stats.regret_buckets[2] += 1;
-                } else if regret < 0.0 {
-                    stats.regret_buckets[3] += 1;
-                } else if regret < 100.0 {
-                    stats.regret_buckets[4] += 1;
-                } else if regret < 10_000.0 {
-                    stats.regret_buckets[5] += 1;
-                } else if regret < 1_000_000.0 {
-                    stats.regret_buckets[6] += 1;
-                } else {
-                    stats.regret_buckets[7] += 1;
-                }
-
-                // Bucket policies
-                if pol_f32 < 1.0 {
-                    stats.policy_buckets[0] += 1;
-                } else if pol_f32 < 10.0 {
-                    stats.policy_buckets[1] += 1;
-                } else if pol_f32 < 100.0 {
-                    stats.policy_buckets[2] += 1;
-                } else if pol_f32 < 1000.0 {
-                    stats.policy_buckets[3] += 1;
-                } else {
-                    stats.policy_buckets[4] += 1;
-                }
-
-                // Collect for entropy calculation
-                weights.push(pol_f32.max(0.0));
+                stats.update_edge(policy, regret);
             }
 
-            // Calculate entropy for this infoset
-            let sum: f32 = weights.iter().sum();
-            if sum > 0.0 {
-                let mut entropy = 0.0f64;
-                let mut max_prob = 0.0f32;
-
-                for w in &weights {
-                    let p = w / sum;
-                    if p > max_prob {
-                        max_prob = p;
-                    }
-                    if p > 0.0 {
-                        entropy -= (p as f64) * (p as f64).ln();
-                    }
-                }
-
-                if max_prob > HIGH_CONFIDENCE_THRESHOLD {
-                    stats.high_confidence_actions += 1;
-                }
-
-                stats.total_entropy += entropy;
-            }
-
-            // Log progress every 10M records
             if processed % 10_000_000 == 0 {
                 log::info!("Processed {} / {} infosets", processed, process_limit);
             }
         }
 
-        // Fix min_edges if no records were processed
-        if stats.min_edges == usize::MAX {
-            stats.min_edges = 0;
-        }
-
-        let avg_edges = if stats.infosets > 0 {
-            stats.total_edges as f64 / stats.infosets as f64
-        } else {
-            0.0
-        };
-
-        // Calculate convergence metrics
-        let convergence_ratio = if stats.total_edges > 0 {
-            stats.near_zero_regrets as f64 / stats.total_edges as f64
-        } else {
-            0.0
-        };
-
-        let determinism_ratio = if stats.infosets > 0 {
-            stats.high_confidence_actions as f64 / stats.infosets as f64
-        } else {
-            0.0
-        };
-
-        let avg_entropy = if stats.infosets > 0 {
-            stats.total_entropy / stats.infosets as f64
-        } else {
-            0.0
-        };
-
-        log::info!("------------------ BLUEPRINT STATS ------------------");
-        log::info!("NOTE: Statistics based on first {} of {} infosets", processed, total_infosets);
-        log::info!("InfoSets processed: {}", stats.infosets);
-        log::info!(
-            "Edges / set:   min {}  max {}  avg {:.2}",
-            stats.min_edges,
-            stats.max_edges,
-            avg_edges
-        );
-        log::info!("Policy range:  [{:.4}, {:.4}]", stats.policy_min, stats.policy_max);
-        log::info!("Regret range:  [{:.4}, {:.4}]", stats.regret_min, stats.regret_max);
-        log::info!(
-            "Zero regrets:  {} ({:.2}% of edges)",
-            stats.zero_regret_count,
-            100.0 * stats.zero_regret_count as f64 / stats.total_edges as f64
-        );
-        log::info!("Regret distribution:");
-        log::info!("  < -1M:       {} edges", stats.regret_buckets[0]);
-        log::info!("  [-1M, -10k): {} edges", stats.regret_buckets[1]);
-        log::info!("  [-10k, -100): {} edges", stats.regret_buckets[2]);
-        log::info!("  [-100, 0):   {} edges", stats.regret_buckets[3]);
-        log::info!("  [0, 100):    {} edges", stats.regret_buckets[4]);
-        log::info!("  [100, 10k):  {} edges", stats.regret_buckets[5]);
-        log::info!("  [10k, 1M):   {} edges", stats.regret_buckets[6]);
-        log::info!("  >= 1M:       {} edges", stats.regret_buckets[7]);
-        log::info!("Policy weight distribution:");
-        log::info!("  [0, 1):      {} edges", stats.policy_buckets[0]);
-        log::info!("  [1, 10):     {} edges", stats.policy_buckets[1]);
-        log::info!("  [10, 100):   {} edges", stats.policy_buckets[2]);
-        log::info!("  [100, 1k):   {} edges", stats.policy_buckets[3]);
-        log::info!("  >= 1k:       {} edges", stats.policy_buckets[4]);
-
-        // Add edge count distribution
-        log::info!("Edge count distribution:");
-        let mut cumulative = 0usize;
-        for (count, freq) in stats.edge_count_dist.iter().enumerate() {
-            if *freq > 0 {
-                cumulative += freq;
-                let pct = *freq as f64 / stats.infosets as f64 * 100.0;
-                let cum_pct = cumulative as f64 / stats.infosets as f64 * 100.0;
-                log::info!(
-                    "  {} edges: {:>10} infosets ({:>5.1}%, cum {:>5.1}%)",
-                    count,
-                    freq,
-                    pct,
-                    cum_pct
-                );
-            }
-        }
-
-        // Convergence metrics
-        log::info!("Convergence metrics:");
-        log::info!("  Near-zero regrets: {:.1}%", convergence_ratio * 100.0);
-        log::info!(
-            "  High-confidence actions: {:.1}%",
-            determinism_ratio * 100.0
-        );
-        log::info!("  Average entropy: {:.3}", avg_entropy);
-
-        // Additional derived metrics
-        let negative_regrets: usize = stats.regret_buckets[0..4].iter().sum();
-        let positive_regrets: usize = stats.regret_buckets[4..].iter().sum();
-        let total_nonzero = negative_regrets + positive_regrets;
-        if total_nonzero > 0 {
-            let balance_ratio = negative_regrets as f64 / total_nonzero as f64;
-            log::info!(
-                "  Negative/Total ratio: {:.1}% (ideal ~50%)",
-                balance_ratio * 100.0
-            );
-        }
-
-        log::info!("-----------------------------------------------------");
+        stats.print_summary(processed, total_infosets);
     }
 
     /// Populates the profile with synthetic data for benchmarking purposes.
