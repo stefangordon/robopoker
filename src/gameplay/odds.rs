@@ -55,7 +55,7 @@ impl Odds {
     pub const GRID: [Self; 10] = Self::PREF_RAISES;
 
     #[cfg(feature = "shortdeck")]
-    pub const GRID: [Self; 5] = Self::PREF_RAISES;
+    pub const GRID: [Self; 3] = Self::PREF_RAISES;
 
     #[cfg(not(feature = "shortdeck"))]
     pub const PREF_RAISES: [Self; 10] = [
@@ -72,7 +72,7 @@ impl Odds {
     ];
 
     #[cfg(feature = "shortdeck")]
-    pub const PREF_RAISES: [Self; 5] = [
+    pub const PREF_RAISES: [Self; 3] = [
         Self(1, 2), // 0.50
         Self(1, 1), // 1.00
         Self(2, 1), // 2.00

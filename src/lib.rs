@@ -60,8 +60,8 @@ mod kmeans_constants {
 
 #[cfg(feature = "shortdeck")]
 mod kmeans_constants {
-    pub const KMEANS_FLOP_TRAINING_ITERATIONS: usize = 20;
-    pub const KMEANS_TURN_TRAINING_ITERATIONS: usize = 24;
+    pub const KMEANS_FLOP_TRAINING_ITERATIONS: usize = 15;
+    pub const KMEANS_TURN_TRAINING_ITERATIONS: usize = 18;
     pub const KMEANS_FLOP_CLUSTER_COUNT: usize = 96;
     pub const KMEANS_TURN_CLUSTER_COUNT: usize = 96;
     pub const KMEANS_EQTY_CLUSTER_COUNT: usize = 96;

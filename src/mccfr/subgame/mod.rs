@@ -48,7 +48,7 @@ use crate::mccfr::nlhe::encoder::BetSizer;
 pub const SUBGAME_RAISES: [Odds; 10] = Odds::GRID;
 
 #[cfg(feature = "shortdeck")]
-pub const SUBGAME_RAISES: [Odds; 5] = Odds::GRID;
+pub const SUBGAME_RAISES: [Odds; 3] = Odds::GRID;
 
 /// Minimum iterations for subgame solving
 pub const SUBGAME_MIN_ITERATIONS: usize = 100;
