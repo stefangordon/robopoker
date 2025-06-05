@@ -582,7 +582,7 @@ impl Profile {
 
         // Build a dedicated thread pool for loading
         rayon::ThreadPoolBuilder::new()
-            .num_threads(6)
+            .num_threads(8)
             .build()
             .expect("Failed to build rayon pool")
             .install(|| {
