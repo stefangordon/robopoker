@@ -1,30 +1,33 @@
-use super::profile::{Profile, FxBuildHasher};
 use super::compact_bucket::CompactBucket;
 use super::edge::Edge;
 use super::info::Info;
+use super::profile::{Profile, FxBuildHasher};
 use crate::cards::street::Street;
-use crate::clustering::abstraction::Abstraction;
-use crate::gameplay::path::Path;
+use crate::save::disk::Disk;
 use crate::Arbitrary;
+use dashmap::DashMap;
+use half::f16;
+use parking_lot::RwLock;
+use std::path::PathBuf;
+
+// Import Path and Abstraction from their correct locations
+use crate::gameplay::path::Path;
+use crate::clustering::abstraction::Abstraction;
 
 #[cfg(feature = "native")]
-use arrow2::{
-    array::{Array, Float32Array, Int64Array, UInt32Array},
-    chunk::Chunk,
-    datatypes::{DataType, Field, Schema},
-    io::parquet::{
+use {
+    arrow2::array::{Array, Float32Array, Int64Array, UInt32Array},
+    arrow2::chunk::Chunk,
+    arrow2::datatypes::{DataType, Field, Schema},
+    arrow2::io::parquet::{
         read::{infer_schema, read_metadata, FileReader},
         write::{
             CompressionOptions, Encoding, FileWriter, RowGroupIterator, Version, WriteOptions,
         },
     },
+    std::sync::Arc,
+    zstd::Decoder as ZDecoder,
 };
-use dashmap::DashMap;
-use half::f16;
-use parking_lot::RwLock;
-use std::path::PathBuf;
-use std::sync::Arc;
-use zstd::stream::Decoder as ZDecoder;
 
 // File format constants and specifications
 //
@@ -44,6 +47,22 @@ use zstd::stream::Decoder as ZDecoder;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const PGCOPY_RECORD_SIZE: usize = 66; // 2-byte header already consumed + 64 payload
 const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
+
+/// Structure to hold stats computed by log_stats
+#[derive(Default)]
+struct ProfileStats {
+    infosets: usize,
+    total_edges: usize,
+    convergence_ratio: f64,
+    mean_positive_regret: f64,
+    negative_total_ratio: f64,
+    near_zero_regrets_pct: f64,
+    regret_min: f32,
+    regret_max: f32,
+    policy_min: f32,
+    policy_max: f32,
+    zero_regrets_pct: f64,
+}
 
 impl Profile {
     /// Log aggregate statistics for regret and policy vectors instead of writing to disk.
@@ -276,6 +295,202 @@ impl Profile {
         }
 
         stats.print_summary(processed, total_infosets);
+    }
+
+    /// Get the path to the progress CSV file
+    #[cfg(feature = "native")]
+    fn progress_csv_path() -> PathBuf {
+        let mut path = PathBuf::from(Profile::path(Street::random()));
+        path.set_file_name("blueprint_progress.csv");
+        path
+    }
+
+    /// Append progress metrics to CSV file for tracking training progress over time.
+    /// This is called hourly during training to log key convergence metrics.
+    #[cfg(feature = "native")]
+    pub fn append_progress_csv(&self, elapsed_hours: f64) {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::time::SystemTime;
+
+        let csv_path = Self::progress_csv_path();
+        let stats = self.compute_stats_for_csv();
+        let needs_header = !csv_path.exists();
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&csv_path)
+            .expect("Failed to open progress CSV file");
+
+        if needs_header {
+            writeln!(
+                file,
+                "timestamp,elapsed_hours,total_traversals,iterations,infosets,convergence_ratio,\
+                mean_positive_regret,negative_total_ratio,near_zero_regrets_pct,regret_min,\
+                regret_max,policy_min,policy_max,zero_regrets_pct"
+            )
+            .expect("Failed to write CSV header");
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        writeln!(
+            file,
+            "{},{:.2},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.2}",
+            timestamp,
+            elapsed_hours,
+            self.total_traversals,
+            self.iterations,
+            stats.infosets,
+            stats.convergence_ratio,
+            stats.mean_positive_regret,
+            stats.negative_total_ratio,
+            stats.near_zero_regrets_pct,
+            stats.regret_min,
+            stats.regret_max,
+            stats.policy_min,
+            stats.policy_max,
+            stats.zero_regrets_pct
+        )
+        .expect("Failed to write CSV row");
+
+        log::info!("Progress logged to {:?}", csv_path);
+    }
+
+    /// Load total traversals from the last line of progress CSV if it exists.
+    /// Returns 0 if the file doesn't exist or can't be parsed.
+    #[cfg(feature = "native")]
+    pub fn load_total_traversals() -> u64 {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+
+        let csv_path = Self::progress_csv_path();
+        
+        if !csv_path.exists() {
+            return 0;
+        }
+
+        // Efficiently read just the last line
+        let file = match File::open(&csv_path) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+
+        let reader = BufReader::new(file);
+        let mut last_line = String::new();
+        
+        // Read all lines but keep only the last one
+        for line in reader.lines().filter_map(Result::ok) {
+            last_line = line;
+        }
+
+        // Parse the last line if it's not empty or the header
+        if !last_line.is_empty() && !last_line.starts_with("timestamp") {
+            let fields: Vec<&str> = last_line.split(',').collect();
+            if fields.len() > 2 {
+                // total_traversals is the 3rd field (index 2)
+                if let Ok(traversals) = fields[2].parse::<u64>() {
+                    log::info!("Resuming from {} total traversals", traversals);
+                    return traversals;
+                }
+            }
+        }
+
+        0
+    }
+
+    /// Compute statistics needed for CSV logging without printing to console.
+    /// Samples up to 300M records to keep computation time reasonable.
+    #[cfg(feature = "native")]
+    fn compute_stats_for_csv(&self) -> ProfileStats {
+        use std::f32::{INFINITY, NEG_INFINITY};
+
+        const MAX_RECORDS: usize = 300_000_000;
+        const ZERO_THRESHOLD: f32 = 1.0;
+
+        let mut stats = ProfileStats::default();
+        stats.regret_min = INFINITY;
+        stats.regret_max = NEG_INFINITY;
+        stats.policy_min = INFINITY;
+        stats.policy_max = NEG_INFINITY;
+
+        let total_infosets = self.encounters.len();
+        let process_limit = total_infosets.min(MAX_RECORDS);
+
+        let mut processed = 0;
+        let mut near_zero_regrets = 0usize;
+        let mut positive_regrets_sum = 0.0f64;
+        let mut positive_regrets_count = 0usize;
+        let mut zero_regret_count = 0usize;
+        let mut negative_regrets = 0usize;
+        let mut positive_regrets = 0usize;
+
+        for bucket_entry in self.encounters.iter() {
+            if processed >= process_limit {
+                break;
+            }
+
+            processed += 1;
+            stats.infosets += 1;
+
+            let bucket = bucket_entry.value().read();
+            let count = bucket.len();
+            stats.total_edges += count;
+
+            for (_, (policy, regret)) in bucket.iter() {
+                let pol_f32 = f32::from(policy);
+                stats.policy_min = stats.policy_min.min(pol_f32);
+                stats.policy_max = stats.policy_max.max(pol_f32);
+                stats.regret_min = stats.regret_min.min(regret);
+                stats.regret_max = stats.regret_max.max(regret);
+
+                // Track regret categories
+                if regret.abs() < ZERO_THRESHOLD {
+                    near_zero_regrets += 1;
+                }
+                if regret == 0.0 {
+                    zero_regret_count += 1;
+                }
+                if regret > 0.0 {
+                    positive_regrets_sum += regret as f64;
+                    positive_regrets_count += 1;
+                    positive_regrets += 1;
+                } else if regret < 0.0 {
+                    negative_regrets += 1;
+                }
+            }
+        }
+
+        // Calculate percentage metrics
+        if stats.total_edges > 0 {
+            let total_edges_f64 = stats.total_edges as f64;
+            stats.convergence_ratio = near_zero_regrets as f64 / total_edges_f64 * 100.0;
+            stats.near_zero_regrets_pct = stats.convergence_ratio; // Same metric
+            stats.zero_regrets_pct = zero_regret_count as f64 / total_edges_f64 * 100.0;
+        }
+
+        // Calculate mean positive regret
+        if positive_regrets_count > 0 {
+            stats.mean_positive_regret = positive_regrets_sum / positive_regrets_count as f64;
+        }
+
+        // Calculate negative/total ratio
+        let total_nonzero = negative_regrets + positive_regrets;
+        if total_nonzero > 0 {
+            stats.negative_total_ratio = negative_regrets as f64 / total_nonzero as f64 * 100.0;
+        }
+
+        // Clean up infinity values
+        if !stats.regret_min.is_finite() { stats.regret_min = 0.0; }
+        if !stats.regret_max.is_finite() { stats.regret_max = 0.0; }
+        if !stats.policy_min.is_finite() { stats.policy_min = 0.0; }
+        if !stats.policy_max.is_finite() { stats.policy_max = 0.0; }
+
+        stats
     }
 
     /// Populates the profile with synthetic data for benchmarking purposes.
@@ -641,9 +856,13 @@ impl Profile {
 
         progress.finish_with_message("Blueprint loaded from parquet");
 
+        // Load total traversals from CSV if it exists
+        let total_traversals = Profile::load_total_traversals();
+
         let profile = Profile {
             encounters,
             iterations: 0,
+            total_traversals,
             regret_min: crate::REGRET_MIN,
             regret_max: crate::REGRET_MAX,
         };
@@ -733,9 +952,13 @@ impl Profile {
             bucket.push((u8::from(edge), (f16::from_f32(policy), regret)));
         }
 
+        // Load total traversals from CSV if it exists
+        let total_traversals = Profile::load_total_traversals();
+
         let profile = Profile {
             encounters,
             iterations: 0,
+            total_traversals,
             regret_min: crate::REGRET_MIN,
             regret_max: crate::REGRET_MAX,
         };

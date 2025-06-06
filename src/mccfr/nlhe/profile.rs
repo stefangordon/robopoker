@@ -28,6 +28,9 @@ fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
 
 pub struct Profile {
     pub(super) iterations: usize,
+    /// Total number of game tree traversals performed across all training runs.
+    /// This persists across checkpoint saves/loads to track cumulative training effort.
+    pub(super) total_traversals: u64,
     pub(super) encounters: DashMap<Info, RwLock<Bucket>, FxBuildHasher>,
     pub(super) regret_min: crate::Utility,
     pub(super) regret_max: crate::Utility,
@@ -37,6 +40,7 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             iterations: 0,
+            total_traversals: 0,
             encounters: DashMap::with_hasher(FxBuildHasher::default()),
             regret_min: crate::REGRET_MIN,
             regret_max: crate::REGRET_MAX,
@@ -624,6 +628,7 @@ impl ProfileBuilder {
     pub fn build(self) -> (Profile, Vec<Decision>) {
         let profile = Profile {
             iterations: 0,
+            total_traversals: 0,
             encounters: DashMap::with_hasher(FxBuildHasher::default()),
             regret_min: self.regret_min,
             regret_max: self.regret_max,

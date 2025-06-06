@@ -394,11 +394,25 @@ pub trait Profile {
         root: &Node<Self::T, Self::E, Self::G, Self::I>,
         leaf: &Node<Self::T, Self::E, Self::G, Self::I>,
     ) -> crate::Utility {
-        let reach = self.relative_reach(root, leaf);
+        // In external sampling MCCFR, we need to compute:
+        // utility = (opponent_reach * payoff) / opponent_sampling_reach
+        //
+        // We exclude the walker's actions from both reach calculations because:
+        // 1. Walker explores ALL actions (not sampled)
+        // 2. Walker's reach probabilities cancel out in the importance sampling correction
+
+        // Compute opponent reach under current strategy σ
+        let opponent_reach = leaf
+            .into_iter()
+            .take_while(|(parent, _)| parent != root)
+            .filter(|(parent, _)| self.walker() != parent.game().turn())
+            .map(|(parent, incoming)| self.outgoing_reach(&parent, &incoming))
+            .product::<crate::Probability>();
+
         let payoff = leaf.game().payoff(root.game().turn());
         let sampling = self.sampling_reach(leaf);
 
-        debug_assert!(!reach.is_nan(), "relative_reach produced NaN");
+        debug_assert!(!opponent_reach.is_nan(), "opponent_reach produced NaN");
         debug_assert!(!payoff.is_nan(), "payoff produced NaN");
         debug_assert!(!sampling.is_nan(), "sampling_reach produced NaN");
         debug_assert!(
@@ -407,8 +421,8 @@ pub trait Profile {
             sampling
         );
 
-        // Compute raw counterfactual utility
-        let raw = reach * payoff / sampling;
+        // Compute importance-sampled counterfactual utility
+        let raw = opponent_reach * payoff / sampling;
         let current_regret_max = self.current_regret_max();
 
         // Determine sign for clamping NaN or infinite values
@@ -444,7 +458,10 @@ pub trait Profile {
     /// visiting this Node?
     fn expected_value(&self, root: &Node<Self::T, Self::E, Self::G, Self::I>) -> crate::Utility {
         assert!(self.walker() == root.game().turn());
-        self.expected_reach(root)
+        // In external sampling MCCFR, we don't include the walker's reach
+        // because the walker explores ALL actions (not sampled).
+        // The walker's reach to this node is implicitly 1.
+        self.cfactual_reach(root)
             * root
                 .descendants()
                 .iter()

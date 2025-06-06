@@ -64,12 +64,34 @@ impl Blueprint for super::solver::NLHE {
         #[cfg(feature = "native")]
         let mut last_checkpoint = Instant::now();
 
+        // Hourly progress logging interval
+        #[cfg(feature = "native")]
+        let progress_interval = Duration::from_secs(3600); // 1 hour
+        #[cfg(feature = "native")]
+        let mut last_progress_log = Instant::now();
+        #[cfg(feature = "native")]
+        let training_start = Instant::now();
+
         // Initialize progress bar (native targets only). The long tick interval ensures
         // updates are throttled and do not add noticeable overhead to the solver.
         #[cfg(feature = "native")]
         let progress = crate::progress(total_iters);
 
         'training: for i in 0..total_iters {
+            // Track total game tree traversals (not iterations) for progress tracking
+            // Each iteration processes batch_size trees
+            self.profile.total_traversals += Self::batch_size() as u64;
+
+            // Hourly progress logging (separate from checkpoints)
+            #[cfg(feature = "native")]
+            {
+                if last_progress_log.elapsed() >= progress_interval {
+                    let elapsed_hours = training_start.elapsed().as_secs_f64() / 3600.0;
+                    self.profile.append_progress_csv(elapsed_hours);
+                    last_progress_log = Instant::now();
+                }
+            }
+
             // Periodic checkpoint every CHECKPOINT_HOURS hours
             #[cfg(feature = "native")]
             {
@@ -174,6 +196,14 @@ impl Blueprint for super::solver::NLHE {
             if self.interrupted() {
                 break 'training;
             }
+        }
+
+        // Log final progress when training completes or is interrupted
+        #[cfg(feature = "native")]
+        {
+            let elapsed_hours = training_start.elapsed().as_secs_f64() / 3600.0;
+            self.profile.append_progress_csv(elapsed_hours);
+            log::info!("Final progress logged after {:.2} hours", elapsed_hours);
         }
 
         // Finalize progress bar once training ends or is interrupted.

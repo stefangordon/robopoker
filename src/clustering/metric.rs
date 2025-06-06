@@ -197,6 +197,28 @@ impl crate::save::disk::Disk for Metric {
     }
 }
 
+impl Metric {
+    /// Save metric for a specific street (fixes the filename inference bug)
+    pub fn save_for_street(&self, street: Street) {
+        const N_FIELDS: u16 = 2;
+        let ref path = <Self as crate::save::disk::Disk>::path(street);
+        let ref mut file = std::fs::File::create(path).expect(&format!("touch {}", path));
+        use byteorder::WriteBytesExt;
+        use byteorder::BE;
+        use std::io::Write;
+        log::info!("{:<32}{:<32}", "saving      metric", path);
+        file.write_all(<Self as crate::save::disk::Disk>::header()).expect("header");
+        for (pair, distance) in self.0.iter() {
+            file.write_u16::<BE>(N_FIELDS).unwrap();
+            file.write_u32::<BE>(size_of::<i64>() as u32).unwrap();
+            file.write_i64::<BE>(i64::from(*pair)).unwrap();
+            file.write_u32::<BE>(size_of::<f32>() as u32).unwrap();
+            file.write_f32::<BE>(*distance).unwrap();
+        }
+        file.write_u16::<BE>(<Self as crate::save::disk::Disk>::footer()).expect("trailer");
+    }
+}
+
 impl From<BTreeMap<Pair, Energy>> for Metric {
     fn from(metric: BTreeMap<Pair, Energy>) -> Self {
         let max = metric.values().copied().fold(f32::MIN_POSITIVE, f32::max);

@@ -254,7 +254,7 @@ impl crate::save::disk::Disk for Layer {
         Lookup::done(street) && Decomp::done(street) && Metric::done(street)
     }
     fn save(&self) {
-        self.metric().save();
+        self.metric().save_for_street(self.street());
         self.lookup().save();
         self.decomp().save();
     }
