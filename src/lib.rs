@@ -89,8 +89,8 @@ const SAMPLING_EXPLORATION: Probability = 0.01;
 
 // regret matching parameters with clamping to prevent numerical instability
 const POLICY_MIN: Probability = Probability::MIN_POSITIVE;
-const REGRET_MIN: Utility = -3e5;
-const REGRET_MAX: Utility = 3e5;
+const REGRET_MIN: Utility = -500_000_000.0;
+const REGRET_MAX: Utility = 500_000_000.0;
 
 #[derive(clap::Parser, Debug)]
 #[command(author, version, about, long_about = None)]

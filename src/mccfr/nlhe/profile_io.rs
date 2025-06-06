@@ -307,6 +307,7 @@ impl Profile {
 
     /// Append progress metrics to CSV file for tracking training progress over time.
     /// This is called hourly during training to log key convergence metrics.
+    /// If the file cannot be written (e.g., locked by another process), logs a warning and continues.
     #[cfg(feature = "native")]
     pub fn append_progress_csv(&self, elapsed_hours: f64) {
         use std::fs::OpenOptions;
@@ -317,20 +318,28 @@ impl Profile {
         let stats = self.compute_stats_for_csv();
         let needs_header = !csv_path.exists();
 
-        let mut file = OpenOptions::new()
+        let mut file = match OpenOptions::new()
             .create(true)
             .append(true)
             .open(&csv_path)
-            .expect("Failed to open progress CSV file");
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Failed to open progress CSV file {:?}: {}", csv_path, e);
+                return;
+            }
+        };
 
         if needs_header {
-            writeln!(
+            if let Err(e) = writeln!(
                 file,
                 "timestamp,elapsed_hours,total_traversals,iterations,infosets,convergence_ratio,\
                 mean_positive_regret,negative_total_ratio,near_zero_regrets_pct,regret_min,\
                 regret_max,policy_min,policy_max,zero_regrets_pct"
-            )
-            .expect("Failed to write CSV header");
+            ) {
+                log::warn!("Failed to write CSV header: {}", e);
+                return;
+            }
         }
 
         let timestamp = SystemTime::now()
@@ -338,7 +347,7 @@ impl Profile {
             .unwrap()
             .as_secs();
 
-        writeln!(
+        if let Err(e) = writeln!(
             file,
             "{},{:.2},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.2}",
             timestamp,
@@ -355,8 +364,10 @@ impl Profile {
             stats.policy_min,
             stats.policy_max,
             stats.zero_regrets_pct
-        )
-        .expect("Failed to write CSV row");
+        ) {
+            log::warn!("Failed to write CSV row: {}", e);
+            return;
+        }
 
         log::info!("Progress logged to {:?}", csv_path);
     }
