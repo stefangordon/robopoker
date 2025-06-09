@@ -1,11 +1,81 @@
 use half::f16;
 use std::fmt;
 
+// Stable-RBP constants
+const EDGE_MASK: u8 = 0x0F;      // Bottom 4 bits for edge value
+const SKIP_MASK: u8 = 0xF0;      // Top 4 bits for skip level
+const SKIP_LEVEL_ACTIVE: u8 = 0; // Not skipped
+const SKIP_LEVEL_TOMBSTONE: u8 = 15; // Permanently pruned
+
+// Skip iteration lookup table - evenly spaced across training iterations
+// With CFR_TREE_COUNT_NLHE = 0x2000000 (33,554,432), each level is ~2.1M iterations
+const SKIP_ITERATIONS: [u32; 16] = [
+    0,           // Level 0: not skipped
+    0x200000,    // Level 1: 2,097,152
+    0x400000,    // Level 2: 4,194,304
+    0x600000,    // Level 3: 6,291,456
+    0x800000,    // Level 4: 8,388,608
+    0xA00000,    // Level 5: 10,485,760
+    0xC00000,    // Level 6: 12,582,912
+    0xE00000,    // Level 7: 14,680,064
+    0x1000000,   // Level 8: 16,777,216
+    0x1200000,   // Level 9: 18,874,368
+    0x1400000,   // Level 10: 20,971,520
+    0x1600000,   // Level 11: 23,068,672
+    0x1800000,   // Level 12: 25,165,824
+    0x1A00000,   // Level 13: 27,262,976
+    0x1C00000,   // Level 14: 29,360,128
+    0x2000000,   // Level 15: 33,554,432 (CFR_TREE_COUNT_NLHE)
+];
+
+/// Find the skip level for a given target iteration
+#[inline(always)]
+fn encode_skip_until_iter(current_iter: u64, skip_iters: u64) -> u8 {
+    let target_iter = current_iter + skip_iters;
+
+    // If target doesn't even reach the first threshold, don't bother encoding
+    // (skip_iters is too small to be meaningful)
+    if target_iter < SKIP_ITERATIONS[1] as u64 {
+        return SKIP_LEVEL_ACTIVE;
+    }
+
+    // If target is beyond horizon, tombstone
+    if target_iter >= SKIP_ITERATIONS[15] as u64 {
+        return SKIP_LEVEL_TOMBSTONE;
+    }
+
+    // Find the largest level whose threshold is <= target_iter
+    // This gives us "the nearest skip iter that is not larger"
+    for level in (1..15).rev() {
+        if SKIP_ITERATIONS[level] as u64 <= target_iter {
+            return level as u8;
+        }
+    }
+    
+    SKIP_LEVEL_ACTIVE
+}
+
 /// A specialized container optimized for poker edge storage.
 /// Similar to SmallVec but with better memory layout for our specific use case.
 ///
 /// Stores up to 4 edges inline, spilling to heap for larger collections.
 /// Memory layout is optimized for the common case (2-4 edges, 81% cumulative).
+///
+/// # Stable-RBP Integration
+///
+/// This implementation supports Regret-Based Pruning (RBP) with zero memory overhead:
+/// - The top 4 bits of each edge byte store skip information
+/// - Skip levels 0-15 map to iteration milestones evenly spaced across training
+/// - Level 0: Active (not skipped)
+/// - Levels 1-14: Skip until reaching 2.1M, 4.2M, ..., 29.4M iterations
+/// - Level 15: Tombstoned (permanent pruning at 33.5M iterations)
+///
+/// ## How it works:
+/// 1. During regret updates, if new regret is negative, check_and_apply_rbp() is called
+/// 2. It calculates skip_iters = ceil(-regret / sum_positive_regrets)
+/// 3. Maps current_iter + skip_iters to the next skip level threshold
+/// 4. Regular iter() skips tombstoned edges; iter_active() also skips temporarily pruned edges
+/// 5. Edges automatically "wake up" when total_traversals passes their skip threshold
 pub struct CompactBucket {
     inner: CompactBucketInner,
 }
@@ -46,24 +116,6 @@ impl LargeBucket {
     fn len(&self) -> usize {
         self.edges.len()
     }
-
-    fn find_by_edge(&self, edge: u8) -> Option<(f16, f32)> {
-        self.edges
-            .iter()
-            .position(|&e| e == edge)
-            .map(|i| (self.policies[i], self.regrets[i]))
-    }
-
-    fn get(&self, index: usize) -> Option<(u8, (f16, f32))> {
-        if index < self.edges.len() {
-            Some((
-                self.edges[index],
-                (self.policies[index], self.regrets[index]),
-            ))
-        } else {
-            None
-        }
-    }
 }
 
 impl CompactBucket {
@@ -93,6 +145,9 @@ impl CompactBucket {
     /// Push a new entry (matches SmallVec::push)
     pub fn push(&mut self, entry: (u8, (f16, f32))) {
         let (edge, (policy, regret)) = entry;
+        // Always store edge with mask cleared (only bottom 4 bits)
+        let edge_val = edge & EDGE_MASK;
+
         match &mut self.inner {
             CompactBucketInner::Small {
                 count,
@@ -102,8 +157,10 @@ impl CompactBucket {
             } => {
                 // Check if edge already exists
                 for i in 0..*count as usize {
-                    if edges[i] == edge {
-                        // Update existing
+                    if (edges[i] & EDGE_MASK) == edge_val {
+                        // Update existing, preserve skip bits
+                        let skip_bits = edges[i] & SKIP_MASK;
+                        edges[i] = edge_val | skip_bits;
                         policies[i] = policy;
                         regrets[i] = regret;
                         return;
@@ -113,7 +170,7 @@ impl CompactBucket {
                 // Add new edge
                 if (*count as usize) < 4 {
                     let idx = *count as usize;
-                    edges[idx] = edge;
+                    edges[idx] = edge_val; // No skip bits for new edge
                     policies[idx] = policy;
                     regrets[idx] = regret;
                     *count += 1;
@@ -121,19 +178,23 @@ impl CompactBucket {
                     // Grow to Large
                     let mut large = Box::new(LargeBucket::with_capacity(5));
                     for i in 0..4 {
+                        // Preserve both edge value and skip bits when moving to Large
                         large.push_triple(edges[i], policies[i], regrets[i]);
                     }
-                    large.push_triple(edge, policy, regret);
+                    large.push_triple(edge_val, policy, regret);
                     self.inner = CompactBucketInner::Large(large);
                 }
             }
             CompactBucketInner::Large(bucket) => {
                 // Check if edge already exists
-                if let Some(pos) = bucket.edges.iter().position(|&e| e == edge) {
+                if let Some(pos) = bucket.edges.iter().position(|&e| (e & EDGE_MASK) == edge_val) {
+                    // Preserve skip bits
+                    let skip_bits = bucket.edges[pos] & SKIP_MASK;
+                    bucket.edges[pos] = edge_val | skip_bits;
                     bucket.policies[pos] = policy;
                     bucket.regrets[pos] = regret;
                 } else {
-                    bucket.push_triple(edge, policy, regret);
+                    bucket.push_triple(edge_val, policy, regret);
                 }
             }
         }
@@ -172,6 +233,15 @@ impl CompactBucket {
         }
     }
 
+    /// Iterate over active (non-skipped) entries based on current iteration
+    pub fn iter_active(&self, current_iter: u64) -> ActiveBucketIter {
+        ActiveBucketIter {
+            bucket: self,
+            index: 0,
+            current_iter,
+        }
+    }
+
     /// Mutable iterator
     pub fn iter_mut(&mut self) -> BucketIterMut {
         BucketIterMut {
@@ -182,6 +252,8 @@ impl CompactBucket {
 
     /// Find entry by edge (commonly used pattern)
     pub fn find_by_edge(&self, edge: u8) -> Option<(f16, f32)> {
+        let edge_val = edge & EDGE_MASK;
+
         match &self.inner {
             CompactBucketInner::Small {
                 count,
@@ -191,21 +263,26 @@ impl CompactBucket {
             } => {
                 // Unrolled for common cases
                 let count = *count as usize;
-                if count > 0 && edges[0] == edge {
+                if count > 0 && (edges[0] & EDGE_MASK) == edge_val {
                     return Some((policies[0], regrets[0]));
                 }
-                if count > 1 && edges[1] == edge {
+                if count > 1 && (edges[1] & EDGE_MASK) == edge_val {
                     return Some((policies[1], regrets[1]));
                 }
-                if count > 2 && edges[2] == edge {
+                if count > 2 && (edges[2] & EDGE_MASK) == edge_val {
                     return Some((policies[2], regrets[2]));
                 }
-                if count > 3 && edges[3] == edge {
+                if count > 3 && (edges[3] & EDGE_MASK) == edge_val {
                     return Some((policies[3], regrets[3]));
                 }
                 None
             }
-            CompactBucketInner::Large(bucket) => bucket.find_by_edge(edge),
+            CompactBucketInner::Large(bucket) => {
+                bucket.edges
+                    .iter()
+                    .position(|&e| (e & EDGE_MASK) == edge_val)
+                    .map(|i| (bucket.policies[i], bucket.regrets[i]))
+            }
         }
     }
 
@@ -235,7 +312,7 @@ impl CompactBucket {
             } => {
                 let count_val = *count as usize;
                 for i in 0..count_val {
-                    if edges[i] == edge {
+                    if edges[i] & EDGE_MASK == edge & EDGE_MASK {
                         regrets[i] = updater(regrets[i]);
                         return true;
                     }
@@ -243,11 +320,43 @@ impl CompactBucket {
                 false
             }
             CompactBucketInner::Large(bucket) => {
-                if let Some(pos) = bucket.edges.iter().position(|&e| e == edge) {
+                if let Some(pos) = bucket.edges.iter().position(|&e| (e & EDGE_MASK) == (edge & EDGE_MASK)) {
                     bucket.regrets[pos] = updater(bucket.regrets[pos]);
                     true
                 } else {
                     false
+                }
+            }
+        }
+    }
+
+    /// Update regret and return the new value
+    pub fn update_regret_with_value<F>(&mut self, edge: u8, updater: F) -> Option<f32>
+    where
+        F: FnOnce(f32) -> f32,
+    {
+        match &mut self.inner {
+            CompactBucketInner::Small {
+                count,
+                edges,
+                policies: _,
+                regrets,
+            } => {
+                let count_val = *count as usize;
+                for i in 0..count_val {
+                    if edges[i] & EDGE_MASK == edge & EDGE_MASK {
+                        regrets[i] = updater(regrets[i]);
+                        return Some(regrets[i]);
+                    }
+                }
+                None
+            }
+            CompactBucketInner::Large(bucket) => {
+                if let Some(pos) = bucket.edges.iter().position(|&e| (e & EDGE_MASK) == (edge & EDGE_MASK)) {
+                    bucket.regrets[pos] = updater(bucket.regrets[pos]);
+                    Some(bucket.regrets[pos])
+                } else {
+                    None
                 }
             }
         }
@@ -267,7 +376,7 @@ impl CompactBucket {
             } => {
                 let count_val = *count as usize;
                 for i in 0..count_val {
-                    if edges[i] == edge {
+                    if edges[i] & EDGE_MASK == edge & EDGE_MASK {
                         let old_val = f32::from(policies[i]);
                         policies[i] = f16::from_f32(updater(old_val));
                         return true;
@@ -276,12 +385,234 @@ impl CompactBucket {
                 false
             }
             CompactBucketInner::Large(bucket) => {
-                if let Some(pos) = bucket.edges.iter().position(|&e| e == edge) {
+                if let Some(pos) = bucket.edges.iter().position(|&e| (e & EDGE_MASK) == (edge & EDGE_MASK)) {
                     let old_val = f32::from(bucket.policies[pos]);
                     bucket.policies[pos] = f16::from_f32(updater(old_val));
                     true
                 } else {
                     false
+                }
+            }
+        }
+    }
+
+    /// Calculate sum of positive regrets
+    #[inline]
+    pub fn sum_positive_regrets(&self) -> f32 {
+        match &self.inner {
+            CompactBucketInner::Small { count, edges, regrets, .. } => {
+                let mut sum = 0.0f32;
+                for i in 0..*count as usize {
+                    // Skip tombstoned edges
+                    if (edges[i] >> 4) != SKIP_LEVEL_TOMBSTONE && regrets[i] > 0.0 {
+                        sum += regrets[i];
+                    }
+                }
+                sum
+            }
+            CompactBucketInner::Large(bucket) => {
+                bucket.edges.iter()
+                    .zip(bucket.regrets.iter())
+                    .filter(|&(&e, &r)| (e >> 4) != SKIP_LEVEL_TOMBSTONE && r > 0.0)
+                    .map(|(_, &r)| r)
+                    .sum()
+            }
+        }
+    }
+
+    /// Check if an edge is currently skipped
+    #[inline]
+    pub fn is_edge_skipped(&self, edge: u8, current_iter: u64) -> bool {
+        let edge_val = edge & EDGE_MASK;
+
+        match &self.inner {
+            CompactBucketInner::Small { count, edges, .. } => {
+                for i in 0..*count as usize {
+                    if (edges[i] & EDGE_MASK) == edge_val {
+                        let skip_level = edges[i] >> 4;
+                        if skip_level == SKIP_LEVEL_ACTIVE {
+                            return false; // Not skipped
+                        }
+                        if skip_level == SKIP_LEVEL_TOMBSTONE {
+                            return true; // Tombstoned = always skipped
+                        }
+                        // Check if we haven't reached the skip threshold yet
+                        return current_iter < SKIP_ITERATIONS[skip_level as usize] as u64;
+                    }
+                }
+                false // Edge not found = not skipped
+            }
+            CompactBucketInner::Large(bucket) => {
+                if let Some(idx) = bucket.edges.iter().position(|&e| (e & EDGE_MASK) == edge_val) {
+                    let skip_level = bucket.edges[idx] >> 4;
+                    if skip_level == SKIP_LEVEL_ACTIVE {
+                        return false;
+                    }
+                    if skip_level == SKIP_LEVEL_TOMBSTONE {
+                        return true; // Tombstoned = always skipped
+                    }
+                    // Check if we haven't reached the skip threshold yet
+                    return current_iter < SKIP_ITERATIONS[skip_level as usize] as u64;
+                }
+                false
+            }
+        }
+    }
+
+    /// Count the number of tombstoned edges in this bucket
+    pub fn count_tombstoned(&self) -> usize {
+        match &self.inner {
+            CompactBucketInner::Small { count, edges, .. } => {
+                let mut tombstoned = 0;
+                for i in 0..*count as usize {
+                    if (edges[i] >> 4) == SKIP_LEVEL_TOMBSTONE {
+                        tombstoned += 1;
+                    }
+                }
+                tombstoned
+            }
+            CompactBucketInner::Large(bucket) => {
+                bucket.edges.iter()
+                    .filter(|&&e| (e >> 4) == SKIP_LEVEL_TOMBSTONE)
+                    .count()
+            }
+        }
+    }
+
+    /// Check if an edge is tombstoned (permanently pruned)
+    #[inline]
+    pub fn is_tombstoned(&self, edge: u8) -> bool {
+        let edge_val = edge & EDGE_MASK;
+
+        match &self.inner {
+            CompactBucketInner::Small { count, edges, .. } => {
+                for i in 0..*count as usize {
+                    if (edges[i] & EDGE_MASK) == edge_val {
+                        return (edges[i] >> 4) == SKIP_LEVEL_TOMBSTONE;
+                    }
+                }
+                false
+            }
+            CompactBucketInner::Large(bucket) => {
+                bucket.edges.iter()
+                    .find(|&&e| (e & EDGE_MASK) == edge_val)
+                    .map_or(false, |&e| (e >> 4) == SKIP_LEVEL_TOMBSTONE)
+            }
+        }
+    }
+
+    /// Clear skip status for an edge (when it wakes up)
+    pub fn clear_skip(&mut self, edge: u8) {
+        let edge_val = edge & EDGE_MASK;
+
+        match &mut self.inner {
+            CompactBucketInner::Small { count, edges, .. } => {
+                for i in 0..*count as usize {
+                    if (edges[i] & EDGE_MASK) == edge_val {
+                        edges[i] = edge_val; // Clear skip bits
+                        return;
+                    }
+                }
+            }
+            CompactBucketInner::Large(bucket) => {
+                if let Some(idx) = bucket.edges.iter().position(|&e| (e & EDGE_MASK) == edge_val) {
+                    bucket.edges[idx] = edge_val; // Clear skip bits
+                }
+            }
+        }
+    }
+
+    /// Check if bucket has any edges with skip bits set
+    #[inline]
+    pub fn has_skipped_edges(&self) -> bool {
+        match &self.inner {
+            CompactBucketInner::Small { count, edges, .. } => {
+                for i in 0..*count as usize {
+                    if edges[i] & SKIP_MASK != 0 {
+                        return true;
+                    }
+                }
+                false
+            }
+            CompactBucketInner::Large(bucket) => {
+                bucket.edges.iter().any(|&e| e & SKIP_MASK != 0)
+            }
+        }
+    }
+
+    /// Get edge value and skip level for debugging
+    #[allow(dead_code)]
+    pub fn edge_skip_info(&self, edge: u8) -> Option<(u8, u8)> {
+        let edge_val = edge & EDGE_MASK;
+
+        match &self.inner {
+            CompactBucketInner::Small { count, edges, .. } => {
+                for i in 0..*count as usize {
+                    if (edges[i] & EDGE_MASK) == edge_val {
+                        return Some((edges[i] & EDGE_MASK, edges[i] >> 4));
+                    }
+                }
+                None
+            }
+            CompactBucketInner::Large(bucket) => {
+                bucket.edges.iter()
+                    .position(|&e| (e & EDGE_MASK) == edge_val)
+                    .map(|i| (bucket.edges[i] & EDGE_MASK, bucket.edges[i] >> 4))
+            }
+        }
+    }
+
+    /// Apply RBP check to a single edge after regret update
+    /// Returns true if edge was pruned
+    /// 
+    /// current_iter: The number of tree traversals in the CURRENT training run only
+    ///               (not cumulative across all runs) to ensure RBP restarts fresh each run
+    #[inline]
+    pub fn check_and_apply_rbp(&mut self, edge: u8, new_regret: f32, current_iter: u64, horizon: u64) -> bool {
+        if new_regret >= 0.0 {
+            return false; // Only prune negative regrets
+        }
+
+        let pos_sum = self.sum_positive_regrets();
+        if pos_sum <= 0.0 {
+            return false; // Can't prune if no positive regrets
+        }
+
+        let skip_iters = ((-new_regret) / pos_sum).ceil() as u64;
+
+        if current_iter + skip_iters >= horizon {
+            // Tombstone
+            self.set_skip_level(edge, SKIP_LEVEL_TOMBSTONE);
+            true
+        } else {
+            // Set skip level
+            let level = encode_skip_until_iter(current_iter, skip_iters);
+            if level > SKIP_LEVEL_ACTIVE {
+                self.set_skip_level(edge, level);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /// Set skip level for an edge
+    #[inline]
+    fn set_skip_level(&mut self, edge: u8, level: u8) {
+        let edge_val = edge & EDGE_MASK;
+
+        match &mut self.inner {
+            CompactBucketInner::Small { count, edges, .. } => {
+                for i in 0..*count as usize {
+                    if (edges[i] & EDGE_MASK) == edge_val {
+                        edges[i] = edge_val | (level << 4);
+                        return;
+                    }
+                }
+            }
+            CompactBucketInner::Large(bucket) => {
+                if let Some(idx) = bucket.edges.iter().position(|&e| (e & EDGE_MASK) == edge_val) {
+                    bucket.edges[idx] = edge_val | (level << 4);
                 }
             }
         }
@@ -338,18 +669,35 @@ impl<'a> Iterator for BucketIter<'a> {
                 policies,
                 regrets,
             } => {
-                if self.index < *count as usize {
+                while self.index < *count as usize {
                     let i = self.index;
                     self.index += 1;
-                    Some((edges[i], (policies[i], regrets[i])))
-                } else {
-                    None
+
+                    // Skip tombstoned edges (permanently pruned)
+                    if (edges[i] >> 4) == SKIP_LEVEL_TOMBSTONE {
+                        continue;
+                    }
+
+                    // Return edge value without skip bits
+                    return Some((edges[i] & EDGE_MASK, (policies[i], regrets[i])));
                 }
+                None
             }
-            CompactBucketInner::Large(bucket) => bucket.get(self.index).map(|entry| {
-                self.index += 1;
-                entry
-            }),
+            CompactBucketInner::Large(bucket) => {
+                while self.index < bucket.edges.len() {
+                    let i = self.index;
+                    self.index += 1;
+
+                    // Skip tombstoned edges (permanently pruned)
+                    if (bucket.edges[i] >> 4) == SKIP_LEVEL_TOMBSTONE {
+                        continue;
+                    }
+
+                    // Return edge value without skip bits
+                    return Some((bucket.edges[i] & EDGE_MASK, (bucket.policies[i], bucket.regrets[i])));
+                }
+                None
+            }
         }
     }
 
@@ -409,6 +757,67 @@ impl<'a> Iterator for BucketIterMut<'a> {
                         None
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Iterator over active (non-skipped) entries
+pub struct ActiveBucketIter<'a> {
+    bucket: &'a CompactBucket,
+    index: usize,
+    current_iter: u64,
+}
+
+impl<'a> Iterator for ActiveBucketIter<'a> {
+    type Item = (u8, (f16, f32));
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &self.bucket.inner {
+            CompactBucketInner::Small {
+                count,
+                edges,
+                policies,
+                regrets,
+            } => {
+                while self.index < *count as usize {
+                    let i = self.index;
+                    self.index += 1;
+
+                    let skip_level = edges[i] >> 4;
+                    // Skip if pruned (tombstoned or temporarily skipped)
+                    if skip_level == SKIP_LEVEL_TOMBSTONE {
+                        continue;
+                    }
+                    if skip_level != SKIP_LEVEL_ACTIVE &&
+                       self.current_iter < SKIP_ITERATIONS[skip_level as usize] as u64 {
+                        continue;
+                    }
+
+                    // Return edge value without skip bits
+                    return Some((edges[i] & EDGE_MASK, (policies[i], regrets[i])));
+                }
+                None
+            }
+            CompactBucketInner::Large(bucket) => {
+                while self.index < bucket.edges.len() {
+                    let i = self.index;
+                    self.index += 1;
+
+                    let skip_level = bucket.edges[i] >> 4;
+                    // Skip if pruned (tombstoned or temporarily skipped)
+                    if skip_level == SKIP_LEVEL_TOMBSTONE {
+                        continue;
+                    }
+                    if skip_level != SKIP_LEVEL_ACTIVE &&
+                       self.current_iter < SKIP_ITERATIONS[skip_level as usize] as u64 {
+                        continue;
+                    }
+
+                    // Return edge value without skip bits
+                    return Some((bucket.edges[i] & EDGE_MASK, (bucket.policies[i], bucket.regrets[i])));
+                }
+                None
             }
         }
     }
@@ -525,5 +934,144 @@ mod tests {
 
         // CompactBucket should be significantly smaller
         assert!(size_of::<CompactBucket>() < size_of::<OriginalBucket>());
+    }
+
+    #[test]
+    fn test_stable_rbp() {
+        let mut bucket = CompactBucket::new();
+
+        // Add edges with regrets
+        bucket.push((1, (f16::from_f32(0.5), 100.0)));  // Positive regret
+        bucket.push((2, (f16::from_f32(0.3), -50.0)));  // Negative regret
+        bucket.push((3, (f16::from_f32(0.2), 25.0)));   // Positive regret
+
+        // Apply RBP pruning to each edge manually
+        let current_iter = 1_000_000;
+        let horizon = 0x2000000; // 33.5M
+        bucket.check_and_apply_rbp(2, -50.0, current_iter, horizon);
+
+        // Edge 2: skip_iters = ceil(50/125) = 1
+        // current_iter (1M) + skip_iters (1) = 1,000,001
+        // Since 1,000,001 < 2,097,152 (first threshold), no skip is encoded
+        assert!(!bucket.is_edge_skipped(2, 1_000_000));   // Should NOT be skipped (skip too small)
+        
+        // Let's test with a larger negative regret that would actually trigger skipping
+        bucket.push((4, (f16::from_f32(0.1), -1_000_000.0)));  // Very negative
+        bucket.check_and_apply_rbp(4, -1_000_000.0, current_iter, horizon);
+        // skip_iters = ceil(1M/125) = 8000
+        // target = 1M + 8000 = 1,008,000 < 2.1M, so still no skip
+        assert!(!bucket.is_edge_skipped(4, current_iter));
+
+        // Edge 1 should not be skipped (positive regret)
+        assert!(!bucket.is_edge_skipped(1, current_iter));
+        // Edge 3 should not be skipped (positive regret, no RBP applied)
+        assert!(!bucket.is_edge_skipped(3, current_iter));
+
+        // Test iter_active - all edges should be active since skip_iters were too small
+        let active: Vec<u8> = bucket.iter_active(current_iter).map(|(e, _)| e).collect();
+        assert_eq!(active, vec![1, 2, 3, 4]); // All edges active (no meaningful skips)
+    }
+
+    #[test]
+    fn test_rbp_large_negative() {
+        let mut bucket = CompactBucket::new();
+
+        // Edge with very negative regret
+        bucket.push((1, (f16::from_f32(0.5), 10.0)));     // Small positive
+        bucket.push((2, (f16::from_f32(0.3), -10000.0))); // Large negative
+
+        // Apply RBP check
+        bucket.check_and_apply_rbp(2, -10000.0, 0, 50_000_000);
+
+        // skip_iters = ceil(10000/10) = 1000
+        // target = 0 + 1000 = 1000
+        // Since 1000 < 2,097,152 (first threshold), no skip is encoded
+        let skip_info = bucket.edge_skip_info(2);
+        assert!(skip_info.is_some());
+        let (_, level) = skip_info.unwrap();
+        assert_eq!(level, SKIP_LEVEL_ACTIVE); // No skip for small skip_iters
+        
+        // Create a scenario where skip_iters would be large enough
+        let mut bucket2 = CompactBucket::new();
+        bucket2.push((1, (f16::from_f32(0.1), 0.001)));    // Tiny positive regret
+        bucket2.push((2, (f16::from_f32(0.1), -3000.0)));  // Large negative
+        
+        // skip_iters = ceil(3000/0.001) = 3,000,000
+        // target = 0 + 3,000,000 = 3,000,000
+        // This is between level 1 (2.1M) and level 2 (4.2M)
+        // So it should get level 1 (skip until 2.1M)
+        bucket2.check_and_apply_rbp(2, -3000.0, 0, crate::CFR_TREE_COUNT_NLHE as u64);
+        let skip_info2 = bucket2.edge_skip_info(2);
+        assert_eq!(skip_info2, Some((2, 1))); // Level 1
+        assert!(bucket2.is_edge_skipped(2, 0));
+        assert!(bucket2.is_edge_skipped(2, 2_000_000));
+        assert!(!bucket2.is_edge_skipped(2, 2_100_000)); // Wake up after threshold
+    }
+
+    #[test]
+    fn test_rbp_integration() {
+        let mut bucket = CompactBucket::new();
+
+        // Add edges with regrets
+        bucket.push((1, (f16::from_f32(0.5), 50.0)));   // Positive
+        bucket.push((2, (f16::from_f32(0.3), -25.0)));  // Negative
+        bucket.push((3, (f16::from_f32(0.2), -1000.0))); // Very negative
+
+        // Apply RBP to negative regret edges
+        bucket.check_and_apply_rbp(2, -25.0, 0, 50_000_000);
+        bucket.check_and_apply_rbp(3, -1000.0, 0, 50_000_000);
+
+        // Test iter() skips tombstoned edges
+        let active_edges: Vec<u8> = bucket.iter().map(|(e, _)| e).collect();
+        assert_eq!(active_edges.len(), 3); // All still visible in basic iter
+
+        // Test that normal get_regret still returns the actual values
+        assert_eq!(bucket.get_regret(1), 50.0);   // Active
+        assert_eq!(bucket.get_regret(2), -25.0);  // Still has negative regret
+        assert_eq!(bucket.get_regret(3), -1000.0); // Still has negative regret
+
+        // Test sum of positive regrets still only counts non-tombstoned
+        assert_eq!(bucket.sum_positive_regrets(), 50.0);
+
+        // Manually tombstone edge 3
+        if let CompactBucketInner::Small { edges, .. } = &mut bucket.inner {
+            edges[2] = (edges[2] & EDGE_MASK) | (SKIP_LEVEL_TOMBSTONE << 4);
+        }
+
+        // Now iter() should skip the tombstoned edge
+        let active_edges: Vec<u8> = bucket.iter().map(|(e, _)| e).collect();
+        assert_eq!(active_edges, vec![1, 2]); // Edge 3 is hidden
+    }
+
+    #[test]
+    fn test_rbp_warmup_respected() {
+        // This test ensures that RBP checks are not applied during warmup period
+        // The actual warmup check is in blueprint.rs, but we can test the mechanism here
+        let mut bucket = CompactBucket::new();
+
+        // Add edges with regrets
+        bucket.push((1, (f16::from_f32(0.5), 100.0)));  // Positive
+        bucket.push((2, (f16::from_f32(0.3), -50.0)));  // Negative
+
+        // With skip_iters = ceil(50/100) = 1, target = 1001
+        // Since 1001 < 2,097,152, no pruning occurs (skip too small)
+        let was_pruned = bucket.check_and_apply_rbp(2, -50.0, 1000, 50_000_000);
+        assert!(!was_pruned); // Skip too small to encode
+        
+        // Test with larger negative regret that would actually prune
+        bucket.push((3, (f16::from_f32(0.1), 0.01)));     // Tiny positive
+        bucket.push((4, (f16::from_f32(0.1), -2100.0)));  // Large negative
+        
+        // skip_iters = ceil(2100/100.01) = 21, but we need millions to reach first threshold
+        // Let's use an extreme case
+        let mut bucket2 = CompactBucket::new();
+        bucket2.push((1, (f16::from_f32(0.1), 0.001)));   // Tiny positive
+        bucket2.push((2, (f16::from_f32(0.1), -2100.0))); // Large negative
+        
+        // skip_iters = ceil(2100/0.001) = 2,100,000
+        // target = 0 + 2,100,000 = 2,100,000 > 2,097,152 (first threshold)
+        let was_pruned2 = bucket2.check_and_apply_rbp(2, -2100.0, 0, crate::CFR_TREE_COUNT_NLHE as u64);
+        assert!(was_pruned2); // This one should prune
+        assert!(bucket2.is_edge_skipped(2, 0));
     }
 }

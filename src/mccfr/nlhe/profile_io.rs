@@ -53,6 +53,8 @@ const PGCOPY_HEADER_SIZE: usize = 19; // PostgreSQL binary COPY header
 struct ProfileStats {
     infosets: usize,
     total_edges: usize,
+    tombstoned_edges_pct: f64,
+    skipped_edges_pct: f64,
     convergence_ratio: f64,
     mean_positive_regret: f64,
     negative_total_ratio: f64,
@@ -78,6 +80,7 @@ impl Profile {
         struct Stats {
             infosets: usize,
             total_edges: usize,
+            tombstoned_edges: usize,
             min_edges: usize,
             max_edges: usize,
             edge_count_dist: [usize; 14],
@@ -99,6 +102,7 @@ impl Profile {
                 Self {
                     infosets: 0,
                     total_edges: 0,
+                    tombstoned_edges: 0,
                     min_edges: usize::MAX,
                     max_edges: 0,
                     edge_count_dist: [0; 14],
@@ -167,7 +171,7 @@ impl Profile {
                 }
             }
 
-            fn print_summary(&self, processed: usize, total_infosets: usize) {
+            fn print_summary(&self, processed: usize, total_infosets: usize, skipped_edges: usize) {
                 log::info!("------------------ BLUEPRINT STATS ------------------");
                 log::info!("NOTE: Statistics based on first {} of {} infosets", processed, total_infosets);
                 log::info!("InfoSets processed: {}", self.infosets);
@@ -181,6 +185,16 @@ impl Profile {
                     if self.min_edges == usize::MAX { 0 } else { self.min_edges },
                     self.max_edges,
                     avg_edges
+                );
+                log::info!(
+                    "Tombstoned edges: {} ({:.2}% of total edges)",
+                    self.tombstoned_edges,
+                    100.0 * self.tombstoned_edges as f64 / self.total_edges.max(1) as f64
+                );
+                log::info!(
+                    "Skipped edges: {} ({:.2}% of total edges)",
+                    skipped_edges,
+                    100.0 * skipped_edges as f64 / self.total_edges.max(1) as f64
                 );
                 log::info!("Policy range:  [{:.4}, {:.4}]", self.policy_min, self.policy_max);
                 log::info!("Regret range:  [{:.4}, {:.4}]", self.regret_min, self.regret_max);
@@ -251,6 +265,18 @@ impl Profile {
 
                 log::info!("-----------------------------------------------------");
             }
+
+            fn print_rbp_status(&self, total_traversals: u64) {
+                if total_traversals < crate::RBP_WARMUP_TRAVERSALS {
+                    log::info!("RBP Status: WARMUP ({:.1}% complete - {}/{} traversals)", 
+                        total_traversals as f64 / crate::RBP_WARMUP_TRAVERSALS as f64 * 100.0,
+                        total_traversals,
+                        crate::RBP_WARMUP_TRAVERSALS);
+                } else {
+                    log::info!("RBP Status: ACTIVE (warmup complete after {} traversals)", 
+                        crate::RBP_WARMUP_TRAVERSALS);
+                }
+            }
         }
 
         // Main processing
@@ -266,6 +292,10 @@ impl Profile {
 
         let mut stats = Stats::default();
         let mut processed = 0;
+        let mut skipped_edges = 0usize;
+        
+        // Get current traversals for skipped edge calculation
+        let current_traversals = self.run_traversals();
 
         for bucket_entry in self.encounters.iter() {
             if processed >= process_limit {
@@ -278,6 +308,7 @@ impl Profile {
             let bucket = bucket_entry.value().read();
             let count = bucket.len();
             stats.total_edges += count;
+            stats.tombstoned_edges += bucket.count_tombstoned();
             stats.min_edges = stats.min_edges.min(count);
             stats.max_edges = stats.max_edges.max(count);
 
@@ -285,6 +316,14 @@ impl Profile {
                 stats.edge_count_dist[count] += 1;
             }
 
+            // Count skipped edges
+            for (edge, _) in bucket.iter() {
+                if bucket.is_edge_skipped(edge, current_traversals) {
+                    skipped_edges += 1;
+                }
+            }
+
+            // Use regular iter to include all edges in statistics
             for (_, (policy, regret)) in bucket.iter() {
                 stats.update_edge(policy, regret);
             }
@@ -294,7 +333,8 @@ impl Profile {
             }
         }
 
-        stats.print_summary(processed, total_infosets);
+        stats.print_summary(processed, total_infosets, skipped_edges);
+        stats.print_rbp_status(self.run_traversals());
     }
 
     /// Get the path to the progress CSV file
@@ -335,7 +375,7 @@ impl Profile {
                 file,
                 "timestamp,elapsed_hours,total_traversals,iterations,infosets,convergence_ratio,\
                 mean_positive_regret,negative_total_ratio,near_zero_regrets_pct,regret_min,\
-                regret_max,policy_min,policy_max,zero_regrets_pct"
+                regret_max,policy_min,policy_max,zero_regrets_pct,tombstoned_edges_pct,skipped_edges_pct"
             ) {
                 log::warn!("Failed to write CSV header: {}", e);
                 return;
@@ -349,7 +389,7 @@ impl Profile {
 
         if let Err(e) = writeln!(
             file,
-            "{},{:.2},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.2}",
+            "{},{:.2},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{:.2}",
             timestamp,
             elapsed_hours,
             self.total_traversals,
@@ -363,7 +403,9 @@ impl Profile {
             stats.regret_max,
             stats.policy_min,
             stats.policy_max,
-            stats.zero_regrets_pct
+            stats.zero_regrets_pct,
+            stats.tombstoned_edges_pct,
+            stats.skipped_edges_pct
         ) {
             log::warn!("Failed to write CSV row: {}", e);
             return;
@@ -439,6 +481,11 @@ impl Profile {
         let mut zero_regret_count = 0usize;
         let mut negative_regrets = 0usize;
         let mut positive_regrets = 0usize;
+        let mut tombstoned_edges = 0usize;
+        let mut skipped_edges = 0usize;
+
+        // Get current traversals for skipped edge calculation
+        let current_traversals = self.run_traversals();
 
         for bucket_entry in self.encounters.iter() {
             if processed >= process_limit {
@@ -451,7 +498,16 @@ impl Profile {
             let bucket = bucket_entry.value().read();
             let count = bucket.len();
             stats.total_edges += count;
+            tombstoned_edges += bucket.count_tombstoned();
 
+            // Count skipped edges (excluding tombstoned)
+            for (edge, _) in bucket.iter() {
+                if bucket.is_edge_skipped(edge, current_traversals) {
+                    skipped_edges += 1;
+                }
+            }
+
+            // Use regular iter to include all edges in statistics
             for (_, (policy, regret)) in bucket.iter() {
                 let pol_f32 = f32::from(policy);
                 stats.policy_min = stats.policy_min.min(pol_f32);
@@ -493,6 +549,12 @@ impl Profile {
         let total_nonzero = negative_regrets + positive_regrets;
         if total_nonzero > 0 {
             stats.negative_total_ratio = negative_regrets as f64 / total_nonzero as f64 * 100.0;
+        }
+
+        // Calculate tombstoned and skipped edges percentages
+        if stats.total_edges > 0 {
+            stats.tombstoned_edges_pct = tombstoned_edges as f64 / stats.total_edges as f64 * 100.0;
+            stats.skipped_edges_pct = skipped_edges as f64 / stats.total_edges as f64 * 100.0;
         }
 
         // Clean up infinity values

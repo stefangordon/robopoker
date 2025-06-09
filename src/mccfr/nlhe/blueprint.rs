@@ -165,7 +165,7 @@ impl Blueprint for super::solver::NLHE {
                             (current_policy * discount_p + delta_p).max(crate::POLICY_MIN)
                         }) {
                             // Policy was updated, now update regret
-                            bucket.update_regret(edge_key, |current_regret| {
+                            if let Some(new_regret) = bucket.update_regret_with_value(edge_key, |current_regret| {
                                 let discount_r = if current_regret > 0.0 {
                                     discount_pos
                                 } else if current_regret < 0.0 {
@@ -175,7 +175,14 @@ impl Blueprint for super::solver::NLHE {
                                 };
                                 (current_regret * discount_r + delta_r)
                                     .clamp(crate::REGRET_MIN, crate::REGRET_MAX)
-                            });
+                            }) {
+                                // Apply RBP check if regret is negative
+                                if new_regret < 0.0 && profile_ref.total_traversals >= crate::RBP_WARMUP_TRAVERSALS {
+                                    let current_iter = profile_ref.run_traversals();
+                                    let horizon = crate::CFR_TREE_COUNT_NLHE as u64;
+                                    bucket.check_and_apply_rbp(edge_key, new_regret, current_iter, horizon);
+                                }
+                            }
                         } else {
                             // No existing record; create new using discounts on zero
                             let new_regret = (0.0 * discount_none + delta_r).clamp(crate::REGRET_MIN, crate::REGRET_MAX);

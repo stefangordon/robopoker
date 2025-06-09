@@ -53,6 +53,12 @@ impl Profile {
         "blueprint".to_string()
     }
 
+    /// Get the number of tree traversals in the current training run only
+    /// (not cumulative across all runs)
+    pub(super) fn run_traversals(&self) -> u64 {
+        self.iterations as u64 * crate::CFR_BATCH_SIZE_NLHE as u64
+    }
+
     /// Calculate convergence metrics for monitoring training progress
     /// NOTE: This function is deprecated and expensive for large datasets.
     /// Use log_stats() instead which computes these metrics more efficiently via sampling.
@@ -155,7 +161,7 @@ impl Profile {
             let mut regrets = [crate::POLICY_MIN; 13];
 
             // Single pass through bucket to gather regrets
-            for (edge_u8, (_, regret)) in bucket.iter() {
+            for (edge_u8, (_, regret)) in bucket.iter_active(self.run_traversals()) {
                 let choice_idx = choice_map[edge_u8 as usize];
                 if choice_idx != 0xff {
                     regrets[choice_idx as usize] = regret.max(crate::POLICY_MIN);
@@ -206,7 +212,7 @@ impl Profile {
             let mut policies = [0.0f32; 13];
 
             // Single pass through bucket to gather policies
-            for (edge_u8, (policy, _)) in bucket.iter() {
+            for (edge_u8, (policy, _)) in bucket.iter_active(self.run_traversals()) {
                 let choice_idx = choice_map[edge_u8 as usize];
                 if choice_idx != 0xff {
                     policies[choice_idx as usize] = f32::from(policy).max(crate::POLICY_MIN);
@@ -265,38 +271,40 @@ impl crate::mccfr::traits::profile::Profile for Profile {
     fn sum_policy(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
         if let Some(bucket_mutex) = self.encounters.get(info) {
             let bucket = bucket_mutex.value().read();
-            bucket
-                .iter()
-                .find_map(|(e, (p, _))| {
-                    if e == u8::from(*edge) {
-                        Some(f32::from(p))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default()
+            let edge_u8 = u8::from(*edge);
+            if bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
+                return 0.0;
+            }
+            
+            // Try to find the edge in the bucket
+            if let Some((policy, _)) = bucket.find_by_edge(edge_u8) {
+                f32::from(policy)
+            } else {
+                // Edge not found - use default value
+                0.0
+            }
         } else {
             0.0
         }
     }
 
     fn sum_regret(&self, info: &Self::I, edge: &Self::E) -> crate::Utility {
-        let regret_val = if let Some(bucket_mutex) = self.encounters.get(info) {
+        if let Some(bucket_mutex) = self.encounters.get(info) {
             let bucket = bucket_mutex.value().read();
-            bucket
-                .iter()
-                .find_map(|(e, (_, r))| if e == u8::from(*edge) { Some(r) } else { None })
-                .unwrap_or_default()
+            let edge_u8 = u8::from(*edge);
+            if bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
+                return 0.0;
+            }
+            
+            // Try to find the edge in the bucket
+            if let Some((_, regret)) = bucket.find_by_edge(edge_u8) {
+                regret
+            } else {
+                // Edge not found - use default value
+                0.0
+            }
         } else {
             0.0
-        };
-
-        if regret_val.is_nan() {
-            // Ensure NaN is not returned. This indicates a NaN was stored previously.
-            log::warn!("sum_regret: Encountered stored NaN for info: {:?}, edge: {:?}. Returning 0.0 instead.", info, edge);
-            0.0
-        } else {
-            regret_val
         }
     }
 
@@ -335,8 +343,8 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             let mut target_regret = crate::POLICY_MIN;
             let mut found_mask = 0u16;
 
-            // Single pass through bucket
-            for (edge_u8, (_, regret)) in bucket.iter() {
+            // Single pass through bucket (active edges only)
+            for (edge_u8, (_, regret)) in bucket.iter_active(self.run_traversals()) {
                 let choice_idx = choice_map[edge_u8 as usize];
                 if choice_idx != 0xff {
                     let r = regret.max(crate::POLICY_MIN);
@@ -348,9 +356,24 @@ impl crate::mccfr::traits::profile::Profile for Profile {
                 }
             }
 
-            // Add defaults for missing edges
-            let missing_count = all_choices.len() - found_mask.count_ones() as usize;
-            sum += missing_count as f32 * crate::POLICY_MIN;
+            let was_target_found = (found_mask & (1 << target_idx)) != 0;
+
+            // Add POLICY_MIN for edges that are not skipped and not found
+            for (idx, &choice_edge) in all_choices.iter().enumerate() {
+                if (found_mask & (1 << idx)) == 0 {
+                    let edge_u8 = u8::from(choice_edge);
+                    if !bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
+                        sum += crate::POLICY_MIN;
+                        if idx == target_idx as usize && !was_target_found {
+                            target_regret = crate::POLICY_MIN;
+                        }
+                    }
+                }
+            }
+
+            if sum == 0.0 {
+                return 0.0;
+            }
 
             target_regret / sum
         } else {
@@ -382,32 +405,20 @@ impl crate::mccfr::traits::profile::Profile for Profile {
 
         if let Some(bucket_mutex) = self.encounters.get(info) {
             let bucket = bucket_mutex.value().read();
-
-            let mut sum = 0.0f32;
-            let mut target_policy = crate::POLICY_MIN;
-            let mut found_mask = 0u16;
-
-            // Single pass through bucket
-            for (edge_u8, (policy, _)) in bucket.iter() {
-                let choice_idx = choice_map[edge_u8 as usize];
-                if choice_idx != 0xff {
-                    let p = f32::from(policy).max(crate::POLICY_MIN);
-                    sum += p;
-                    if choice_idx == target_idx {
-                        target_policy = p;
-                    }
-                    found_mask |= 1 << choice_idx;
-                }
+            let edge_u8 = u8::from(*edge);
+            if bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
+                return 0.0;
             }
-
-            // Add defaults for missing edges
-            let missing_count = all_choices.len() - found_mask.count_ones() as usize;
-            sum += missing_count as f32 * crate::POLICY_MIN;
-
-            target_policy / sum
+            
+            // Try to find the edge in the bucket
+            if let Some((_, regret)) = bucket.find_by_edge(edge_u8) {
+                regret.max(crate::POLICY_MIN)
+            } else {
+                // Edge not found - return POLICY_MIN (it's a valid but unexplored edge)
+                crate::POLICY_MIN
+            }
         } else {
-            // No data: uniform distribution
-            1.0 / all_choices.len() as f32
+            crate::POLICY_MIN
         }
     }
 
@@ -443,8 +454,8 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             let mut target_policy = 0.0f32;
             let mut found_mask = 0u16;
 
-            // Single pass through bucket
-            for (edge_u8, (policy, _)) in bucket.iter() {
+            // Single pass through bucket (active edges only)
+            for (edge_u8, (policy, _)) in bucket.iter_active(self.run_traversals()) {
                 let choice_idx = choice_map[edge_u8 as usize];
                 if choice_idx != 0xff {
                     let p = f32::from(policy).max(crate::POLICY_MIN);
@@ -456,13 +467,20 @@ impl crate::mccfr::traits::profile::Profile for Profile {
                 }
             }
 
-            // Add defaults for missing edges (but not to target if it wasn't found)
             let was_target_found = (found_mask & (1 << target_idx)) != 0;
-            if !was_target_found {
-                target_policy = crate::POLICY_MIN;
+
+            // Add POLICY_MIN for edges that are not skipped and not found
+            for (idx, &choice_edge) in all_choices.iter().enumerate() {
+                if (found_mask & (1 << idx)) == 0 {
+                    let edge_u8 = u8::from(choice_edge);
+                    if !bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
+                        sum += crate::POLICY_MIN;
+                        if idx == target_idx as usize && !was_target_found {
+                            target_policy = crate::POLICY_MIN;
+                        }
+                    }
+                }
             }
-            let missing_count = all_choices.len() - found_mask.count_ones() as usize;
-            sum += missing_count as f32 * crate::POLICY_MIN;
 
             // Apply sampling formula: q(a) = max(ε, (β + τ * weight(a)) / (β + sum(weights)))
             let denom = activation + sum;
@@ -523,7 +541,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             let mut edge_policies = [0.0f32; 256]; // indexed by edge u8 value
             let mut total_policy = 0.0f32;
 
-            for (edge_u8, (policy, _)) in bucket.iter() {
+            for (edge_u8, (policy, _)) in bucket.iter_active(self.run_traversals()) {
                 let p = f32::from(policy).max(crate::POLICY_MIN);
                 edge_policies[edge_u8 as usize] = p;
                 total_policy += p;
@@ -534,8 +552,10 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             for edge in &all_choices {
                 let edge_u8 = u8::from(*edge);
                 if edge_policies[edge_u8 as usize] == 0.0 {
-                    edge_policies[edge_u8 as usize] = crate::POLICY_MIN;
-                    total_policy += crate::POLICY_MIN;
+                    if !bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
+                        edge_policies[edge_u8 as usize] = crate::POLICY_MIN;
+                        total_policy += crate::POLICY_MIN;
+                    }
                 }
             }
 
@@ -642,6 +662,7 @@ impl ProfileBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mccfr::traits::profile::Profile as ProfileTrait;
 
     /// Helper to create a test CompactBucket with known values
     fn create_test_bucket() -> CompactBucket {
@@ -833,5 +854,91 @@ mod tests {
             "Expected p2: {}",
             expected_p2
         );
+    }
+
+    // Additional test ensuring advice skips pruned edges
+    #[test]
+    fn test_advice_respects_skip() {
+        use crate::gameplay::edge::Edge as GEdge;
+
+        // Build an Info with three choices Fold, Check, Call
+        let futures = vec![GEdge::Fold, GEdge::Check, GEdge::Call];
+        let info = Info::from((
+            crate::gameplay::path::Path::default(),
+            crate::clustering::abstraction::Abstraction::from(0u64),
+            crate::gameplay::path::Path::from(futures.clone()),
+        ));
+
+        let mut bucket = CompactBucket::new();
+        // Positive regrets for Fold & Check
+        bucket.push((u8::from(GEdge::Fold), (f16::from_f32(0.5), 10.0)));
+        bucket.push((u8::from(GEdge::Check), (f16::from_f32(0.5), 5.0)));
+        // Negative regret for Call that leads to pruning
+        bucket.push((u8::from(GEdge::Call), (f16::from_f32(0.5), -10.0)));
+
+        // Apply RBP to Call so it is skipped for a while
+        bucket.check_and_apply_rbp(
+            u8::from(GEdge::Call),
+            -10.0,
+            0,
+            crate::CFR_TREE_COUNT_NLHE as u64,
+        );
+
+        let profile = Profile::default();
+        profile
+            .encounters
+            .insert(info, RwLock::new(bucket));
+
+        // Advice for pruned Call edge should be zero
+        assert_eq!(profile.advice(&info, &GEdge::Call), 0.0);
+    }
+
+    // Test that RBP uses per-run traversals, not cumulative
+    #[test]
+    fn test_rbp_uses_run_traversals() {
+        use crate::gameplay::edge::Edge as GEdge;
+
+        let mut profile = Profile::default();
+        // Simulate a resumed training run with high total_traversals
+        // but low iterations (just started this run)
+        profile.total_traversals = 20_000_000; // 20M from previous runs
+        profile.iterations = 10; // Only 10 iterations in current run
+
+        // Per-run traversals should be 10 * 1024 = 10,240
+        assert_eq!(profile.run_traversals(), 10_240);
+
+        let futures = vec![GEdge::Fold, GEdge::Check, GEdge::Call];
+        let info = Info::from((
+            crate::gameplay::path::Path::default(),
+            crate::clustering::abstraction::Abstraction::from(0u64),
+            crate::gameplay::path::Path::from(futures.clone()),
+        ));
+
+        let mut bucket = CompactBucket::new();
+        bucket.push((u8::from(GEdge::Fold), (f16::from_f32(0.5), 100.0)));
+        bucket.push((u8::from(GEdge::Check), (f16::from_f32(0.5), 50.0)));
+        bucket.push((u8::from(GEdge::Call), (f16::from_f32(0.5), -50.0)));
+
+        // Apply RBP - skip_iters = ceil(50/150) = 1
+        // With run_traversals = 10,240, this should skip until level 1 (2,097,152)
+        bucket.check_and_apply_rbp(
+            u8::from(GEdge::Call),
+            -50.0,
+            profile.run_traversals(),
+            crate::CFR_TREE_COUNT_NLHE as u64,
+        );
+
+        profile.encounters.insert(info, RwLock::new(bucket));
+
+        // Call should be skipped since run_traversals (10,240) < skip threshold (2,097,152)
+        assert_eq!(profile.advice(&info, &GEdge::Call), 0.0);
+        assert_eq!(profile.sum_policy(&info, &GEdge::Call), 0.0);
+        assert_eq!(profile.sum_regret(&info, &GEdge::Call), 0.0);
+
+        // Simulate more iterations in current run
+        profile.iterations = 2_100; // 2100 * 1024 = 2,150,400 > 2,097,152
+        
+        // Now Call should be active again
+        assert!(profile.advice(&info, &GEdge::Call) > 0.0);
     }
 }
