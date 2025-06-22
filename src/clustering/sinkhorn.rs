@@ -39,25 +39,23 @@ impl Sinkhorn<'_> {
     }
     /// calculate next iteration of LHS and RHS potentials after Sinkhorn scaling
     fn lhs(&self) -> Potential {
-        Potential::from(
-            self.lhs
-                .support()
-                .copied()
-                .map(|x| (x, self.divergence(&x, &self.mu, &self.rhs)))
-                .inspect(|(_, dx)| assert!(dx.is_finite(), "lhs entropy overflow"))
-                .collect::<BTreeMap<_, _>>(),
-        )
+        let mut map = BTreeMap::new();
+        for &x in self.lhs.support() {
+            let val = self.divergence(&x, &self.mu, &self.rhs);
+            assert!(val.is_finite(), "lhs entropy overflow");
+            map.insert(x, val);
+        }
+        Potential::from(map)
     }
     /// calculate next iteration of LHS and RHS potentials after Sinkhorn scaling
     fn rhs(&self) -> Potential {
-        Potential::from(
-            self.rhs
-                .support()
-                .copied()
-                .map(|x| (x, self.divergence(&x, &self.nu, &self.lhs)))
-                .inspect(|(_, dx)| assert!(dx.is_finite(), "rhs entropy overflow"))
-                .collect::<BTreeMap<_, _>>(),
-        )
+        let mut map = BTreeMap::new();
+        for &x in self.rhs.support() {
+            let val = self.divergence(&x, &self.nu, &self.lhs);
+            assert!(val.is_finite(), "rhs entropy overflow");
+            map.insert(x, val);
+        }
+        Potential::from(map)
     }
     /// the coupling formed by joint distribution of LHS and RHS potentials
     fn coupling(&self, x: &Abstraction, y: &Abstraction) -> Energy {
@@ -70,14 +68,12 @@ impl Sinkhorn<'_> {
     /// not sure yet why i'm calling it entropy but it's giving partition function.
     /// actually now that i think of it this might be KL div / relative entropy
     fn divergence(&self, x: &Abstraction, histogram: &Histogram, potential: &Potential) -> Entropy {
-        histogram.density(x).ln()
-            - potential
-                .support()
-                .map(|y| potential.density(y) - self.regularization(x, y))
-                .map(|e| e.exp())
-                .map(|e| e.max(Energy::MIN_POSITIVE))
-                .sum::<Energy>()
-                .ln()
+        let mut z = 0.0;
+        for y in potential.support() {
+            let e = (potential.density(y) - self.regularization(x, y)).exp();
+            z += e.max(Energy::MIN_POSITIVE);
+        }
+        histogram.density(x).ln() - z.ln()
     }
     /// distance in fixed temperature exponent space
     fn regularization(&self, x: &Abstraction, y: &Abstraction) -> Entropy {
@@ -85,10 +81,12 @@ impl Sinkhorn<'_> {
     }
     /// stopping criteria
     fn delta(prev: &Potential, next: &Potential) -> Energy {
-        prev.support()
-            .map(|x| next.density(x).exp() - prev.density(x).exp())
-            .map(|e| e.abs())
-            .sum::<Energy>()
+        let mut sum = 0.0;
+        for x in prev.support() {
+            let diff = next.density(x).exp() - prev.density(x).exp();
+            sum += diff.abs();
+        }
+        sum
     }
     /// hyperparameter that determines strength of entropic regularization. incorrect units but whatever
     const fn temperature(&self) -> Entropy {

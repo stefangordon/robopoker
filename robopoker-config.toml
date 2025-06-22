@@ -1,0 +1,35 @@
+selected = "mini"
+
+[nlhe]
+# pot-normalized bet sizing for full deck NLHE
+pref_raises = [ [1,4], [1,2], [3,4], [1,1], [2,1], [4,1] ]
+flop_raises = [ [1,2], [1,1], [2,1] ]
+late_raises = [ [1,1], [2,1] ]
+last_raises = [ [1,1] ]
+
+# K-Means cluster counts
+kmeans_flop_cluster_count = 32
+kmeans_turn_cluster_count = 48
+kmeans_eqty_cluster_count = 24
+
+# NLHE MCCFR parameters
+cfr_batch_size_nlhe   = 1024
+cfr_tree_count_nlhe   = 0xF000000
+rbp_warmup_traversals = 0x1000000
+
+[mini]
+# reduced bet sizing grid for short-deck Hold'em
+pref_raises = [ [1,2], [1,1], [2,1] ]
+flop_raises = [ [1,2], [1,1], [2,1] ]
+late_raises = [ [1,1], [2,1] ]
+last_raises = [ [1,1] ]
+
+# K-Means cluster counts for short-deck Hold'em
+kmeans_flop_cluster_count = 16
+kmeans_turn_cluster_count = 24
+kmeans_eqty_cluster_count = 12
+
+# Use same trainer parameters unless you want to tune separately
+cfr_batch_size_nlhe   = 1024
+cfr_tree_count_nlhe   = 0xF000000
+rbp_warmup_traversals = 0x1000000

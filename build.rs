@@ -1,0 +1,192 @@
+use std::env;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
+
+fn main() {
+    // allow rustc to recognize `cfg(rust_analyzer)` so cargo check emits no warning
+    println!("cargo:rustc-check-cfg=cfg(rust_analyzer)");
+
+    // Where the config file is expected to be found (crate root)
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("MANIFEST dir");
+    let config_path = Path::new(&manifest_dir).join("robopoker-config.toml");
+
+    // Fallback to default parameters if the config file is missing or invalid.
+    let (grid, flop, late, last, pref,
+        cfr_batch_size_nlhe, cfr_tree_count_nlhe, rbp_warmup,
+        kmeans_flop_cluster_count, kmeans_turn_cluster_count, kmeans_eqty_cluster_count) =
+        match fs::read_to_string(&config_path) {
+            Ok(toml_source) => match toml::from_str::<toml::Value>(&toml_source) {
+                Ok(value) => {
+                    // Resolve selected profile
+                    let selected = value
+                        .get("selected")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default");
+                    let chosen = value
+                        .get(selected)
+                        .and_then(|v| v.as_table())
+                        .expect("selected configuration table missing");
+
+                    // Helper to lift 2-element integer arrays into Vec<(i16,i16)>
+                    let read_vec = |key: &str| -> Vec<(i16, i16)> {
+                        chosen
+                            .get(key)
+                            .and_then(|v| v.as_array())
+                            .expect("missing bet sizing array")
+                            .iter()
+                            .map(|pair| {
+                                let arr = pair
+                                    .as_array()
+                                    .expect("pair must be an array with two integers");
+                                let a = arr[0].as_integer().expect("numerator") as i16;
+                                let b = arr[1].as_integer().expect("denominator") as i16;
+                                (a, b)
+                            })
+                            .collect()
+                    };
+
+                    let pref = read_vec("pref_raises");
+                    let grid = if let Some(_grid) = chosen.get("grid") {
+                        read_vec("grid")
+                    } else {
+                        pref.clone()
+                    };
+                    let flop = read_vec("flop_raises");
+                    let late = read_vec("late_raises");
+                    let last = read_vec("last_raises");
+
+                    let cfr_batch_size_nlhe = chosen
+                        .get("cfr_batch_size_nlhe")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(1024) as usize;
+                    let cfr_tree_count_nlhe = chosen
+                        .get("cfr_tree_count_nlhe")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(0xF000000) as usize;
+                    let rbp_warmup = chosen
+                        .get("rbp_warmup_traversals")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(0x1000000) as u64;
+                    let kmeans_flop_cluster_count = chosen
+                        .get("kmeans_flop_cluster_count")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(128) as usize;
+                    let kmeans_turn_cluster_count = chosen
+                        .get("kmeans_turn_cluster_count")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(144) as usize;
+                    let kmeans_eqty_cluster_count = chosen
+                        .get("kmeans_eqty_cluster_count")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(101) as usize;
+
+                    (grid, flop, late, last, pref, cfr_batch_size_nlhe, cfr_tree_count_nlhe, rbp_warmup, kmeans_flop_cluster_count, kmeans_turn_cluster_count, kmeans_eqty_cluster_count)
+                }
+                Err(_) => default_values(),
+            },
+            Err(_) => default_values(),
+        };
+
+    // Write generated odds constants (inside impl Odds)
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let odds_path = Path::new(&out_dir).join("odds_config.rs");
+    let mut odds_file = File::create(&odds_path).expect("create odds config file");
+
+    generate_odds_constants(&mut odds_file, &grid, &pref, &flop, &late, &last)
+        .expect("write odds constants");
+
+    // Write generated library constants
+    let lib_path = Path::new(&out_dir).join("lib_config.rs");
+    let mut lib_file = File::create(&lib_path).expect("create lib config file");
+    writeln!(lib_file, "// Auto-generated by build.rs – do not edit")
+        .unwrap();
+    writeln!(lib_file, "pub const CFR_BATCH_SIZE_NLHE: usize = {cfr_batch_size_nlhe};").unwrap();
+    writeln!(lib_file, "pub const CFR_TREE_COUNT_NLHE: usize = {cfr_tree_count_nlhe};").unwrap();
+    writeln!(lib_file, "pub const RBP_WARMUP_TRAVERSALS: u64 = {rbp_warmup};").unwrap();
+    writeln!(lib_file, "pub const KMEANS_FLOP_CLUSTER_COUNT: usize = {kmeans_flop_cluster_count};").unwrap();
+    writeln!(lib_file, "pub const KMEANS_TURN_CLUSTER_COUNT: usize = {kmeans_turn_cluster_count};").unwrap();
+    writeln!(lib_file, "pub const KMEANS_EQTY_CLUSTER_COUNT: usize = {kmeans_eqty_cluster_count};").unwrap();
+}
+
+fn default_values() -> (
+    Vec<(i16, i16)>,
+    Vec<(i16, i16)>,
+    Vec<(i16, i16)>,
+    Vec<(i16, i16)>,
+    Vec<(i16, i16)>,
+    usize,
+    usize,
+    u64,
+    usize,
+    usize,
+    usize,
+) {
+    let pref = vec![
+        (1, 4),
+        (1, 3),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        (1, 1),
+        (3, 2),
+        (2, 1),
+        (3, 1),
+        (4, 1),
+    ];
+    let grid = pref.clone();
+    let flop = vec![(1, 2), (3, 4), (1, 1), (3, 2), (2, 1)];
+    let late = vec![(1, 2), (1, 1), (3, 2), (2, 1)];
+    let last = vec![(1, 1), (3, 2)];
+
+    (
+        grid,
+        flop,
+        late,
+        last,
+        pref,
+        1024,
+        0xF000000,
+        0x1000000,
+        128,
+        144,
+        101,
+    )
+}
+
+fn generate_odds_constants(
+    file: &mut File,
+    grid: &[(i16, i16)],
+    pref: &[(i16, i16)],
+    flop: &[(i16, i16)],
+    late: &[(i16, i16)],
+    last: &[(i16, i16)],
+) -> std::io::Result<()> {
+    writeln!(file, "// Auto-generated by build.rs – do not edit")?;
+    writeln!(file, "impl crate::gameplay::odds::Odds {{")?;
+
+    fn write_array(
+        file: &mut File,
+        name: &str,
+        data: &[(i16, i16)],
+    ) -> std::io::Result<()> {
+        writeln!(
+            file,
+            "pub const {name}: [Self; {len}] = [",
+            name = name,
+            len = data.len()
+        )?;
+        for (a, b) in data {
+            writeln!(file, "    Self({a}, {b}),", a = a, b = b)?;
+        }
+        writeln!(file, "];\n")
+    }
+
+    write_array(file, "GRID", grid)?;
+    write_array(file, "PREF_RAISES", pref)?;
+    write_array(file, "FLOP_RAISES", flop)?;
+    write_array(file, "LATE_RAISES", late)?;
+    write_array(file, "LAST_RAISES", last)?;
+    writeln!(file, "}}")?;
+    Ok(())
+} 

@@ -140,6 +140,66 @@ impl Profile {
         }
     }
 
+    /// Get all regrets for an infoset (used by subgame solver)
+    pub fn get_all_regrets(&self, info: &Info) -> Vec<(Edge, f32)> {
+        let all_choices = info.choices();
+        if all_choices.is_empty() {
+            return Vec::new();
+        }
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
+
+            // Build result vector with all edges and their regrets
+            all_choices
+                .into_iter()
+                .map(|edge| {
+                    let edge_u8 = u8::from(edge);
+                    if bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
+                        (edge, 0.0)
+                    } else if let Some((_, regret)) = bucket.find_by_edge(edge_u8) {
+                        (edge, regret)
+                    } else {
+                        (edge, 0.0)
+                    }
+                })
+                .collect()
+        } else {
+            // No data: all regrets are 0
+            all_choices.into_iter().map(|edge| (edge, 0.0)).collect()
+        }
+    }
+
+    /// Get all policies for an infoset (used by subgame solver)
+    pub fn get_all_policies(&self, info: &Info) -> Vec<(Edge, f32)> {
+        let all_choices = info.choices();
+        if all_choices.is_empty() {
+            return Vec::new();
+        }
+
+        if let Some(bucket_mutex) = self.encounters.get(info) {
+            let bucket = bucket_mutex.value().read();
+
+            // Build result vector with all edges and their policies
+            all_choices
+                .into_iter()
+                .map(|edge| {
+                    let edge_u8 = u8::from(edge);
+                    if bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
+                        (edge, 0.0)
+                    } else if let Some((policy, _)) = bucket.find_by_edge(edge_u8) {
+                        (edge, f32::from(policy))
+                    } else {
+                        (edge, 0.0)
+                    }
+                })
+                .collect()
+        } else {
+            // No data: all policies are 0
+            all_choices.into_iter().map(|edge| (edge, 0.0)).collect()
+        }
+    }
+
     /// Compute the entire policy distribution for an infoset using regret matching.
     /// This does a single DashMap lookup and returns normalized probabilities for all edges.
     fn policy_distribution(&self, info: &Info) -> Policy<Edge> {
@@ -275,7 +335,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             if bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
                 return 0.0;
             }
-            
+
             // Try to find the edge in the bucket
             if let Some((policy, _)) = bucket.find_by_edge(edge_u8) {
                 f32::from(policy)
@@ -295,7 +355,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             if bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
                 return 0.0;
             }
-            
+
             // Try to find the edge in the bucket
             if let Some((_, regret)) = bucket.find_by_edge(edge_u8) {
                 regret
@@ -315,71 +375,63 @@ impl crate::mccfr::traits::profile::Profile for Profile {
         self.regret_max
     }
 
-    // Override the default policy() method to use direct bucket access
+    // Optimised allocation-free implementation of policy(), mirroring the
+    // changes made to sample().  We iterate directly over the futures Path
+    // instead of materialising a Vec, and we early-exit if the edge is pruned.
     fn policy(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
-        let all_choices = info.choices();
-        if all_choices.is_empty() {
+        // Quick reject if the edge is not in the futures path.
+        if !info.futures().clone().any(|e| e == *edge) {
             return 0.0;
         }
 
-        // Early check if edge is in choices and build lookup map
-        let mut choice_map = [0xff_u8; 256];
-        let mut target_idx = 0xff_u8;
-        for (i, &choice) in all_choices.iter().enumerate() {
-            choice_map[u8::from(choice) as usize] = i as u8;
-            if choice == *edge {
-                target_idx = i as u8;
-            }
-        }
-
-        if target_idx == 0xff {
-            return 0.0; // Edge not in choices
-        }
+        let run_trav = self.run_traversals();
+        let mut sum = 0.0f32;
+        let mut target_regret = 0.0f32;
 
         if let Some(bucket_mutex) = self.encounters.get(info) {
             let bucket = bucket_mutex.value().read();
 
-            let mut sum = 0.0f32;
-            let mut target_regret = crate::POLICY_MIN;
-            let mut found_mask = 0u16;
+            // Single scan over the reachable edges.
+            let mut it = *info.futures();
+            while let Some(e) = it.next() {
+                let edge_u8 = u8::from(e);
 
-            // Single pass through bucket (active edges only)
-            for (edge_u8, (_, regret)) in bucket.iter_active(self.run_traversals()) {
-                let choice_idx = choice_map[edge_u8 as usize];
-                if choice_idx != 0xff {
-                    let r = regret.max(crate::POLICY_MIN);
-                    sum += r;
-                    if choice_idx == target_idx {
-                        target_regret = r;
+                // Skip edges pruned by RBP.
+                if bucket.is_edge_skipped(edge_u8, run_trav) {
+                    if e == *edge {
+                        return 0.0; // Target edge is currently pruned.
                     }
-                    found_mask |= 1 << choice_idx;
+                    continue;
                 }
-            }
 
-            let was_target_found = (found_mask & (1 << target_idx)) != 0;
+                let regret = bucket
+                    .find_by_edge(edge_u8)
+                    .map(|(_, r)| r)
+                    .unwrap_or(crate::POLICY_MIN)
+                    .max(crate::POLICY_MIN);
 
-            // Add POLICY_MIN for edges that are not skipped and not found
-            for (idx, &choice_edge) in all_choices.iter().enumerate() {
-                if (found_mask & (1 << idx)) == 0 {
-                    let edge_u8 = u8::from(choice_edge);
-                    if !bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
-                        sum += crate::POLICY_MIN;
-                        if idx == target_idx as usize && !was_target_found {
-                            target_regret = crate::POLICY_MIN;
-                        }
-                    }
+                if e == *edge {
+                    target_regret = regret;
                 }
-            }
 
-            if sum == 0.0 {
-                return 0.0;
+                sum += regret;
             }
-
-            target_regret / sum
         } else {
-            // No data: uniform distribution
-            1.0 / all_choices.len() as f32
+            // No bucket yet – assume uniform minimal regret.
+            let mut it = *info.futures();
+            while let Some(e) = it.next() {
+                if e == *edge {
+                    target_regret = crate::POLICY_MIN;
+                }
+                sum += crate::POLICY_MIN;
+            }
         }
+
+        if sum == 0.0 {
+            return 0.0;
+        }
+
+        target_regret / sum
     }
 
     // Override the default advice() method to use direct bucket access
@@ -409,7 +461,7 @@ impl crate::mccfr::traits::profile::Profile for Profile {
             if bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
                 return 0.0;
             }
-            
+
             // Try to find the edge in the bucket
             if let Some((_, regret)) = bucket.find_by_edge(edge_u8) {
                 regret.max(crate::POLICY_MIN)
@@ -422,74 +474,64 @@ impl crate::mccfr::traits::profile::Profile for Profile {
         }
     }
 
-    // Override the sample() method to use batch access
+    // Optimised heap-free implementation: iterate directly over the futures Path
+    // instead of materialising a Vec via `info.choices()`.  This removes the last
+    // remaining allocation in the hot `sample()` path.
     fn sample(&self, info: &Self::I, edge: &Self::E) -> crate::Probability {
-        let all_choices = info.choices();
-        if all_choices.is_empty() {
-            return 0.0;
-        }
-
-        // Early check if edge is in choices
-        let target_idx = match all_choices.iter().position(|&e| e == *edge) {
-            Some(idx) => idx,
-            None => return 0.0,
-        };
-
         // Constants for sampling formula
         let activation = crate::SAMPLING_ACTIVATION;
         let threshold = crate::SAMPLING_THRESHOLD;
         let exploration = crate::SAMPLING_EXPLORATION;
 
+        // Verify the target edge is actually reachable from this infoset and count futures.
+        let mut futures_iter = *info.futures();
+        let mut edge_present = false;
+        let mut futures_len = 0usize;
+        while let Some(e) = futures_iter.next() {
+            if e == *edge {
+                edge_present = true;
+            }
+            futures_len += 1;
+        }
+        if !edge_present || futures_len == 0 {
+            return 0.0;
+        }
+
+        let run_trav = self.run_traversals();
+
         if let Some(bucket_mutex) = self.encounters.get(info) {
             let bucket = bucket_mutex.value().read();
 
-            // Build choice map for O(1) lookups
-            let mut choice_map = [0xff_u8; 256];
-            for (i, &choice) in all_choices.iter().enumerate() {
-                choice_map[u8::from(choice) as usize] = i as u8;
-            }
-
-            // Direct computation without intermediate storage
+            // Second pass to accumulate policies.
+            let mut futures_iter = *info.futures();
             let mut sum = 0.0f32;
             let mut target_policy = 0.0f32;
-            let mut found_mask = 0u16;
 
-            // Single pass through bucket (active edges only)
-            for (edge_u8, (policy, _)) in bucket.iter_active(self.run_traversals()) {
-                let choice_idx = choice_map[edge_u8 as usize];
-                if choice_idx != 0xff {
-                    let p = f32::from(policy).max(crate::POLICY_MIN);
-                    sum += p;
-                    if choice_idx as usize == target_idx {
-                        target_policy = p;
-                    }
-                    found_mask |= 1 << choice_idx;
+            while let Some(e) = futures_iter.next() {
+                let edge_u8 = u8::from(e);
+                if bucket.is_edge_skipped(edge_u8, run_trav) {
+                    continue;
                 }
+
+                let p = bucket
+                    .find_by_edge(edge_u8)
+                    .map(|(policy, _)| f32::from(policy))
+                    .unwrap_or(crate::POLICY_MIN)
+                    .max(crate::POLICY_MIN);
+
+                if e == *edge {
+                    target_policy = p;
+                }
+
+                sum += p;
             }
 
-            let was_target_found = (found_mask & (1 << target_idx)) != 0;
-
-            // Add POLICY_MIN for edges that are not skipped and not found
-            for (idx, &choice_edge) in all_choices.iter().enumerate() {
-                if (found_mask & (1 << idx)) == 0 {
-                    let edge_u8 = u8::from(choice_edge);
-                    if !bucket.is_edge_skipped(edge_u8, self.run_traversals()) {
-                        sum += crate::POLICY_MIN;
-                        if idx == target_idx as usize && !was_target_found {
-                            target_policy = crate::POLICY_MIN;
-                        }
-                    }
-                }
-            }
-
-            // Apply sampling formula: q(a) = max(ε, (β + τ * weight(a)) / (β + sum(weights)))
             let denom = activation + sum;
             let numer = activation + target_policy * threshold;
             (numer / denom).max(exploration)
         } else {
-            // No data: all policies are POLICY_MIN
-            let n = all_choices.len() as f32;
-            let sum = n * crate::POLICY_MIN;
+            // No bucket yet – treat all edges as POLICY_MIN.
+            let sum = futures_len as f32 * crate::POLICY_MIN;
             let target_policy = crate::POLICY_MIN;
             let denom = activation + sum;
             let numer = activation + target_policy * threshold;
@@ -937,7 +979,7 @@ mod tests {
 
         // Simulate more iterations in current run
         profile.iterations = 2_100; // 2100 * 1024 = 2,150,400 > 2,097,152
-        
+
         // Now Call should be active again
         assert!(profile.advice(&info, &GEdge::Call) > 0.0);
     }

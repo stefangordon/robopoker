@@ -102,7 +102,6 @@ fn process_infoset(
         '_,
         Info,
         parking_lot::RwLock<super::compact_bucket::CompactBucket>,
-        super::profile::FxBuildHasher,
     >,
 ) -> Option<ModelRecord> {
     let info = entry.key();

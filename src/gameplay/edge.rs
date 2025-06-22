@@ -80,7 +80,7 @@ impl From<u8> for Edge {
             3 => Edge::Check,
             4 => Edge::Call,
             5 => Edge::Shove,
-            i @ 6..=15 => Edge::Raise(Odds::GRID[i as usize - 6]),
+            i @ 6..=MAX_RAISE_CODE => Edge::Raise(Odds::GRID[i as usize - 6]),
             _ => unreachable!("invalid edge encoding"),
         }
     }
@@ -169,3 +169,6 @@ impl Arbitrary for Edge {
         }
     }
 }
+
+// Determine the upper bound for raise edge encoding at compile time
+const MAX_RAISE_CODE: u8 = 6 + Odds::GRID.len() as u8 - 1;

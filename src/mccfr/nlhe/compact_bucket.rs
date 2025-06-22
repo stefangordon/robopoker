@@ -7,25 +7,28 @@ const SKIP_MASK: u8 = 0xF0;      // Top 4 bits for skip level
 const SKIP_LEVEL_ACTIVE: u8 = 0; // Not skipped
 const SKIP_LEVEL_TOMBSTONE: u8 = 15; // Permanently pruned
 
-// Skip iteration lookup table - evenly spaced across training iterations
-// With CFR_TREE_COUNT_NLHE = 0x2000000 (33,554,432), each level is ~2.1M iterations
+// Skip iteration lookup table – evenly spaced up to ~252 million traversals.
+// Horizon (level 15) now matches 0xF000000 = 251,658,240 iterations.
+// Each step is 0x1000000 = 16,777,216 traversals (~16 M).
+// If you change `CFR_TREE_COUNT_NLHE` via TOML, adjust this table to keep
+// level 15 ≥ horizon, otherwise edges may never tombstone.
 const SKIP_ITERATIONS: [u32; 16] = [
-    0,           // Level 0: not skipped
-    0x200000,    // Level 1: 2,097,152
-    0x400000,    // Level 2: 4,194,304
-    0x600000,    // Level 3: 6,291,456
-    0x800000,    // Level 4: 8,388,608
-    0xA00000,    // Level 5: 10,485,760
-    0xC00000,    // Level 6: 12,582,912
-    0xE00000,    // Level 7: 14,680,064
-    0x1000000,   // Level 8: 16,777,216
-    0x1200000,   // Level 9: 18,874,368
-    0x1400000,   // Level 10: 20,971,520
-    0x1600000,   // Level 11: 23,068,672
-    0x1800000,   // Level 12: 25,165,824
-    0x1A00000,   // Level 13: 27,262,976
-    0x1C00000,   // Level 14: 29,360,128
-    0x2000000,   // Level 15: 33,554,432 (CFR_TREE_COUNT_NLHE)
+    0x0000000,  // 0  – Active
+    0x1000000,  // 1  – 16.7 M
+    0x2000000,  // 2  – 33.5 M
+    0x3000000,  // 3  – 50.3 M
+    0x4000000,  // 4  – 67.1 M
+    0x5000000,  // 5  – 83.9 M
+    0x6000000,  // 6  – 100.7 M
+    0x7000000,  // 7  – 117.6 M
+    0x8000000,  // 8  – 134.4 M
+    0x9000000,  // 9  – 151.2 M
+    0xA000000,  // 10 – 168.0 M
+    0xB000000,  // 11 – 184.8 M
+    0xC000000,  // 12 – 201.7 M
+    0xD000000,  // 13 – 218.5 M
+    0xE000000,  // 14 – 235.3 M
+    0xF000000,  // 15 – 251.6 M (tombstone threshold)
 ];
 
 /// Find the skip level for a given target iteration
@@ -51,7 +54,7 @@ fn encode_skip_until_iter(current_iter: u64, skip_iters: u64) -> u8 {
             return level as u8;
         }
     }
-    
+
     SKIP_LEVEL_ACTIVE
 }
 
@@ -564,7 +567,7 @@ impl CompactBucket {
 
     /// Apply RBP check to a single edge after regret update
     /// Returns true if edge was pruned
-    /// 
+    ///
     /// current_iter: The number of tree traversals in the CURRENT training run only
     ///               (not cumulative across all runs) to ensure RBP restarts fresh each run
     #[inline]
@@ -954,7 +957,7 @@ mod tests {
         // current_iter (1M) + skip_iters (1) = 1,000,001
         // Since 1,000,001 < 2,097,152 (first threshold), no skip is encoded
         assert!(!bucket.is_edge_skipped(2, 1_000_000));   // Should NOT be skipped (skip too small)
-        
+
         // Let's test with a larger negative regret that would actually trigger skipping
         bucket.push((4, (f16::from_f32(0.1), -1_000_000.0)));  // Very negative
         bucket.check_and_apply_rbp(4, -1_000_000.0, current_iter, horizon);
@@ -990,12 +993,12 @@ mod tests {
         assert!(skip_info.is_some());
         let (_, level) = skip_info.unwrap();
         assert_eq!(level, SKIP_LEVEL_ACTIVE); // No skip for small skip_iters
-        
+
         // Create a scenario where skip_iters would be large enough
         let mut bucket2 = CompactBucket::new();
         bucket2.push((1, (f16::from_f32(0.1), 0.001)));    // Tiny positive regret
         bucket2.push((2, (f16::from_f32(0.1), -3000.0)));  // Large negative
-        
+
         // skip_iters = ceil(3000/0.001) = 3,000,000
         // target = 0 + 3,000,000 = 3,000,000
         // This is between level 1 (2.1M) and level 2 (4.2M)
@@ -1057,17 +1060,17 @@ mod tests {
         // Since 1001 < 2,097,152, no pruning occurs (skip too small)
         let was_pruned = bucket.check_and_apply_rbp(2, -50.0, 1000, 50_000_000);
         assert!(!was_pruned); // Skip too small to encode
-        
+
         // Test with larger negative regret that would actually prune
         bucket.push((3, (f16::from_f32(0.1), 0.01)));     // Tiny positive
         bucket.push((4, (f16::from_f32(0.1), -2100.0)));  // Large negative
-        
+
         // skip_iters = ceil(2100/100.01) = 21, but we need millions to reach first threshold
         // Let's use an extreme case
         let mut bucket2 = CompactBucket::new();
         bucket2.push((1, (f16::from_f32(0.1), 0.001)));   // Tiny positive
         bucket2.push((2, (f16::from_f32(0.1), -2100.0))); // Large negative
-        
+
         // skip_iters = ceil(2100/0.001) = 2,100,000
         // target = 0 + 2,100,000 = 2,100,000 > 2,097,152 (first threshold)
         let was_pruned2 = bucket2.check_and_apply_rbp(2, -2100.0, 0, crate::CFR_TREE_COUNT_NLHE as u64);

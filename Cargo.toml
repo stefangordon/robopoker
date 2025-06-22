@@ -10,6 +10,7 @@ keywords = ["poker", "cards", "cfr", "mcts", "holdem"]
 license = "MIT"
 edition = "2021"
 default-run = "robopoker"
+build = "build.rs"
 
 [dependencies]
 petgraph = "0.6.5"
@@ -39,7 +40,7 @@ console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.2", features = ["js"] }
 rustc-hash = "1.1"
 zstd = { version = "0.12", features = ["zstdmt"] }
-dashmap = "5"
+dashmap = { version = "6.1", features = ["rayon"] }
 parking_lot = "0.12"
 smallvec = "1.11"
 ahash = "0.8"
@@ -91,3 +92,6 @@ required-features = ["subgame"]
 
 [profile.release]
 debug = true
+
+[build-dependencies]
+toml = "0.8"

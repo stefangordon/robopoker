@@ -69,7 +69,25 @@ impl Iterator for Path {
             Some(Edge::from(x))
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let mut bits = self.0;
+        let mut len = 0usize;
+        while bits != 0 {
+            let nibble = (bits & 0xF) as u8;
+            if nibble == 0 {
+                break;
+            }
+            len += 1;
+            bits >>= 4;
+        }
+        (len, Some(len))
+    }
 }
+
+impl std::iter::ExactSizeIterator for Path {}
+
+impl std::iter::FusedIterator for Path {}
 
 impl std::iter::FromIterator<Edge> for Path {
     fn from_iter<T: IntoIterator<Item = Edge>>(iter: T) -> Self {

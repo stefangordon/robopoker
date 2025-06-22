@@ -8,26 +8,46 @@ use crate::transport::coupling::Coupling;
 use crate::transport::measure::Measure;
 use crate::Energy;
 use std::collections::BTreeMap;
+use std::mem::size_of;
 
 /// Distance metric for kmeans clustering.
 /// encapsulates distance between `Abstraction`s of the "previous" hierarchy,
 /// as well as: distance between `Histogram`s of the "current" hierarchy.
+///
+/// The first field (BTreeMap) is kept for deterministic ordering during
+/// persistence and for existing code/tests that iterate over `Metric.0`.
+/// The second field is a dense K×K matrix (flattened into Vec<Vec<Energy>>)
+/// that allows constant-time distance look-ups during clustering / Sinkhorn.
+///
+/// This internal augmentation does **not** change any algorithmic results –
+/// it just avoids the O(log N) tree search previously done in every call to
+/// `Metric::distance`.
 #[derive(Default)]
-pub struct Metric(BTreeMap<Pair, Energy>);
+pub struct Metric(BTreeMap<Pair, Energy>, Vec<Vec<Energy>>);
 
 impl Measure for Metric {
     type X = Abstraction;
     type Y = Abstraction;
     fn distance(&self, x: &Self::X, y: &Self::Y) -> Energy {
         if x == y {
-            0.
-        } else {
-            match (x, y) {
-                (Self::X::Learned(_), Self::Y::Learned(_)) => self.lookup(x, y),
-                (Self::X::Percent(_), Self::Y::Percent(_)) => Equity.distance(x, y),
-                (Self::X::Preflop(_), Self::Y::Preflop(_)) => unreachable!("no preflop distance"),
-                _ => unreachable!(),
+            return 0.0;
+        }
+
+        match (x, y) {
+            // Fast-path for learned abstractions using the dense matrix when available.
+            (Self::X::Learned(_), Self::Y::Learned(_)) => {
+                if !self.1.is_empty() {
+                    // Bounds are guaranteed by Abstraction::index() / street.k()
+                    return self.1[x.index()][y.index()];
+                }
+                // Fallback (should never be hit after build-dense path)
+                self.lookup(x, y)
             }
+            (Self::X::Percent(_), Self::Y::Percent(_)) => Equity.distance(x, y),
+            (Self::X::Preflop(_), Self::Y::Preflop(_)) => {
+                unreachable!("no preflop distance")
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -79,6 +99,29 @@ impl Metric {
 
     fn name() -> String {
         "metric".to_string()
+    }
+
+    /// Pre-compute the dense K×K matrix for fast look-ups. Returns empty vec
+    /// when the metric is not for a learned street (river / preflop).
+    fn dense(map: &BTreeMap<Pair, Energy>, street: Street) -> Vec<Vec<Energy>> {
+        // Only flop / turn metrics use learned abstractions.
+        if !matches!(street, Street::Flop | Street::Turn) {
+            return Vec::new();
+        }
+
+        let k = street.k();
+        let mut matrix = vec![vec![0.0; k]; k];
+        for i in 0..k {
+            for j in 0..i {
+                let a = Abstraction::from((street, i));
+                let b = Abstraction::from((street, j));
+                let pair = Pair::from((&a, &b));
+                let d = *map.get(&pair).expect("missing abstraction pair");
+                matrix[i][j] = d;
+                matrix[j][i] = d; // symmetry
+            }
+        }
+        matrix
     }
 }
 
@@ -166,7 +209,8 @@ impl crate::save::disk::Disk for Metric {
                 n => panic!("unexpected number of fields: {}", n),
             }
         }
-        Self(metric)
+        let dense = Metric::dense(&metric, street);
+        Self(metric, dense)
     }
     fn save(&self) {
         const N_FIELDS: u16 = 2;
@@ -222,12 +266,17 @@ impl Metric {
 impl From<BTreeMap<Pair, Energy>> for Metric {
     fn from(metric: BTreeMap<Pair, Energy>) -> Self {
         let max = metric.values().copied().fold(f32::MIN_POSITIVE, f32::max);
-        Self(
-            metric
-                .into_iter()
-                .map(|(index, distance)| (index, distance / max))
-                .collect(),
-        )
+        let normalized: BTreeMap<_, _> = metric
+            .into_iter()
+            .map(|(pair, dist)| (pair, dist / max))
+            .collect();
+
+        // Infer street from pair count to build dense matrix.
+        let temp_metric = Metric(normalized.clone(), Vec::new());
+        let street = temp_metric.street();
+        let dense = Metric::dense(&normalized, street);
+
+        Metric(normalized, dense)
     }
 }
 #[cfg(test)]
