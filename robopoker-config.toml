@@ -13,7 +13,7 @@ kmeans_turn_cluster_count = 48
 kmeans_eqty_cluster_count = 24
 
 # NLHE MCCFR parameters
-cfr_batch_size_nlhe   = 1024
+cfr_batch_size_nlhe   = 4096
 cfr_tree_count_nlhe   = 0xF000000
 rbp_warmup_traversals = 0x1000000
 
